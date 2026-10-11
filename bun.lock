@@ -181,6 +181,19 @@
         "vitest": "^3.2.4",
       },
     },
+    "packages/provider-llbot": {
+      "name": "@botroost/provider-llbot",
+      "version": "0.0.0",
+      "dependencies": {
+        "@botroost/contracts": "workspace:*",
+        "@botroost/provider-sdk": "workspace:*",
+        "@botroost/runtime-sdk": "workspace:*",
+        "zod": "catalog:",
+      },
+      "devDependencies": {
+        "vitest": "^3.2.4",
+      },
+    },
     "packages/provider-napcat": {
       "name": "@botroost/provider-napcat",
       "version": "0.0.0",
@@ -371,6 +384,8 @@
     "@botroost/database": ["@botroost/database@workspace:packages/database"],
 
     "@botroost/provider-fake": ["@botroost/provider-fake@workspace:packages/provider-fake"],
+
+    "@botroost/provider-llbot": ["@botroost/provider-llbot@workspace:packages/provider-llbot"],
 
     "@botroost/provider-napcat": ["@botroost/provider-napcat@workspace:packages/provider-napcat"],
 

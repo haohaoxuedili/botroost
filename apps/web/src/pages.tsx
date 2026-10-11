@@ -21,8 +21,8 @@ export function Endpoints({session,q}:{session:Session;q:ReturnType<typeof useAp
  return <Stack>
   <PageHeading kicker={t('endpoints.kicker')} title={t('endpoints.title')} description={t('endpoints.description')} action={<div className="page-heading-actions"><Button className="endpoint-refresh-action" variant="outline" aria-label={t('endpoints.refreshStatus')} disabled={q.refreshing} onClick={()=>void q.refresh()}><RefreshCw className={q.refreshing?'refresh-spin':undefined}/><span className="refresh-label">{q.refreshing?t('common.refreshing'):t('common.refresh')}</span></Button>{canCreate?<Button onClick={()=>setOpen(true)}>{t('endpoints.create')}</Button>:null}</div>}/>
   {q.data!.items.length===0?<Empty name={t('endpoints.empty')}/>:<Table headers={[t('endpoints.colName'),t('endpoints.colProvider'),t('endpoints.colNode'),t('endpoints.colActivity'),t('endpoints.colNodeStatus'),t('endpoints.colRuntime'),t('endpoints.colProviderStatus'),t('endpoints.colProtocol'),t('endpoints.colConvergence')]} rows={q.data!.items.map(ep=>[<Link to={`/endpoints/${ep.id}`}>{ep.name}</Link>,ep.providerId,ep.node?.name??t('common.unassigned'),ep.activeOperation?<OperationProgressView operation={ep.activeOperation} compact/>:<span className="muted">{t('common.idle')}</span>,...statusLayers(ep.status).map(x=><Badge good={['connected','online','ready','available','converged'].includes(x.value)}>{x.value}</Badge>)])}/>}
-  <Modal open={open} onClose={closeCreate} title={provider?t('endpoints.configure'):t('endpoints.create')} description={provider?t('endpoints.chooseNode',{provider:provider==='napcat'?t('endpoints.napcat'):provider==='snowluma'?t('endpoints.snowluma'):provider}):t('endpoints.chooseProvider')} footer={provider?<><Button type="button" variant="outline" disabled={busy} onClick={()=>{setProvider('');setNodeId('');setError(undefined)}}>{t('common.back')}</Button><Button type="submit" form="create-endpoint-form" busy={busy} disabled={!nodeId}>{t('endpoints.create')}</Button></>:<Button variant="outline" onClick={closeCreate}>{t('common.cancel')}</Button>}>
-    {!provider?<div className="provider-picker">{Object.entries(session.capabilities.providers??{}).map(([providerId,gate])=>{const label=providerId==='napcat'?t('endpoints.napcat'):providerId==='snowluma'?t('endpoints.snowluma'):providerId==='fake'?t('endpoints.fake'):providerId;return <button type="button" className="provider-choice" key={providerId} disabled={!gate.enabled} onClick={()=>{setProvider(providerId);setError(undefined)}}><span><strong>{label}</strong><small>{providerId==='napcat'?t('endpoints.napcatHint'):providerId==='snowluma'?t('endpoints.snowlumaHint'):t('endpoints.providerHint')}</small></span><Badge good={gate.enabled}>{gate.enabled?t('common.available'):t('common.unavailable')}</Badge>{gate.reason?<small className="provider-reason">{gate.reason}</small>:null}</button>})}</div>:<Stack><Select label={t('endpoints.node')} required value={nodeId} onChange={e=>setNodeId(e.currentTarget.value)}><option value="">{t('endpoints.selectNode')}</option>{nodes.data!.items.filter(n=>n.provider===provider).map(n=><option value={n.id} key={n.id}>{n.name}</option>)}</Select><SchemaForm key={provider} formId="create-endpoint-form" fields={fields} submitLabel={t('endpoints.create')} showSubmit={false} busy={busy} onSubmit={v=>{if(nodeId)void create(v)}}/>{error?<Failure error={error}/>:null}</Stack>}
+  <Modal open={open} onClose={closeCreate} title={provider?t('endpoints.configure'):t('endpoints.create')} description={provider?t('endpoints.chooseNode',{provider:provider==='napcat'?t('endpoints.napcat'):provider==='snowluma'?t('endpoints.snowluma'):provider==='llbot'?t('endpoints.llbot'):provider}):t('endpoints.chooseProvider')} footer={provider?<><Button type="button" variant="outline" disabled={busy} onClick={()=>{setProvider('');setNodeId('');setError(undefined)}}>{t('common.back')}</Button><Button type="submit" form="create-endpoint-form" busy={busy} disabled={!nodeId}>{t('endpoints.create')}</Button></>:<Button variant="outline" onClick={closeCreate}>{t('common.cancel')}</Button>}>
+    {!provider?<div className="provider-picker">{Object.entries(session.capabilities.providers??{}).map(([providerId,gate])=>{const label=providerId==='napcat'?t('endpoints.napcat'):providerId==='snowluma'?t('endpoints.snowluma'):providerId==='llbot'?t('endpoints.llbot'):providerId==='fake'?t('endpoints.fake'):providerId;return <button type="button" className="provider-choice" key={providerId} disabled={!gate.enabled} onClick={()=>{setProvider(providerId);setError(undefined)}}><span><strong>{label}</strong><small>{providerId==='napcat'?t('endpoints.napcatHint'):providerId==='snowluma'?t('endpoints.snowlumaHint'):providerId==='llbot'?t('endpoints.llbotHint'):t('endpoints.providerHint')}</small></span><Badge good={gate.enabled}>{gate.enabled?t('common.available'):t('common.unavailable')}</Badge>{gate.reason?<small className="provider-reason">{gate.reason}</small>:null}</button>})}</div>:<Stack><Select label={t('endpoints.node')} required value={nodeId} onChange={e=>setNodeId(e.currentTarget.value)}><option value="">{t('endpoints.selectNode')}</option>{nodes.data!.items.filter(n=>n.provider===provider).map(n=><option value={n.id} key={n.id}>{n.name}</option>)}</Select><SchemaForm key={provider} formId="create-endpoint-form" fields={fields} submitLabel={t('endpoints.create')} showSubmit={false} busy={busy} onSubmit={v=>{if(nodeId)void create(v)}}/>{error?<Failure error={error}/>:null}</Stack>}
   </Modal>
  </Stack>;
 }
@@ -33,6 +33,8 @@ type TrafficEvent={at:string;direction:'inbound'|'outbound';scope:'group'|'priva
 type ConnectionEvent={at:string;transport:'websocket-client'|'websocket-server';status:'listening'|'connected'|'disconnected'|'reconnecting'|'error'};
 type ProtocolTraffic={status:'ok'|'partial'|'unavailable';complete?:boolean;source:string;privacy:'aggregate_only';observedAt:string;sampleIntervalSeconds:number;oneMinute:TrafficWindow;fiveMinutes:TrafficWindow;buckets:{startedAt:string;inbound:number;outbound:number;total:number}[];recent:TrafficEvent[];recentConnections:ConnectionEvent[];error?:string};
 type NapCatStatus={qq:null|Record<string,unknown>;onebot:null|{status?:Record<string,unknown>;loginInfo?:Record<string,unknown>;version?:Record<string,unknown>;probes?:Record<string,OneBotProbe>;directory?:{friends:OneBotDirectoryCollection;groups:OneBotDirectoryCollection};config?:{websocketClients?:WsClient[];websocketServers?:WsServer[]}};traffic?:ProtocolTraffic;freshness?:TrafficFreshness};
+type LLBotLoginGuide={webuiPort?:number};
+type LLBotStatus={qq:null|Record<string,unknown>;login:null|Record<string,unknown>;onebot:NapCatStatus['onebot'];traffic?:ProtocolTraffic|null;loginGuide?:null|LLBotLoginGuide;freshness?:TrafficFreshness};
 type SnowlumaLoginGuide={novncPort?:number;webuiPort?:number;webuiUsername?:string;webuiPassword?:string};
 type SnowlumaStatus={qq:null|Record<string,unknown>;login:null|Record<string,unknown>;onebot:NapCatStatus['onebot'];traffic?:ProtocolTraffic|null;loginGuide?:null|SnowlumaLoginGuide;freshness?:TrafficFreshness};
 const titleCase=(value:string)=>value.charAt(0).toUpperCase()+value.slice(1).replaceAll('-',' ');
@@ -66,6 +68,7 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   const q=useApi<Endpoint>(`/endpoints/${id}`,endpointPollInterval);
   const canOperate=session.permissions.includes('endpoint:start');
   const napcat=useApi<NapCatStatus>(`/endpoints/${id}/napcat/status`,3000,canOperate&&q.data?.providerId==='napcat');
+  const llbot=useApi<LLBotStatus>(`/endpoints/${id}/llbot/status`,3000,canOperate&&q.data?.providerId==='llbot');
   const snowluma=useApi<SnowlumaStatus>(`/endpoints/${id}/snowluma/status`,3000,canOperate&&q.data?.providerId==='snowluma');
   const [clients,setClients]=useState<WsClient[]>([]);
   const [servers,setServers]=useState<WsServer[]>([]);
@@ -79,16 +82,16 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   const [error,setError]=useState<unknown>();
   const [directory,setDirectory]=useState<'friends'|'groups'>('friends');
   const ep=q.data;
-  const providerData=ep?.providerId==='snowluma'?snowluma.data:napcat.data;
+  const providerData=ep?.providerId==='snowluma'?snowluma.data:ep?.providerId==='llbot'?llbot.data:napcat.data;
   const qq=providerData?.qq;
   const onebot=providerData?.onebot;
   const traffic=providerData?.traffic;
   const providerFreshness=providerData?.freshness;
-  const providerRequestFailed=ep?.providerId==='snowluma'?Boolean(snowluma.error):Boolean(napcat.error);
+  const providerRequestFailed=ep?.providerId==='snowluma'?Boolean(snowluma.error):ep?.providerId==='llbot'?Boolean(llbot.error):Boolean(napcat.error);
   const loggedIn=qq?.online===true||onebot?.status?.online===true;
   const qr=useApi<{qrcode:string}>(canOperate&&ep?.providerId==='napcat'&&!loggedIn?`/endpoints/${id}/napcat/login-qrcode`:'/disabled',5000);
 
-  const wsConfig=ep?.providerId==='snowluma'?snowluma.data?.onebot?.config:napcat.data?.onebot?.config;
+  const wsConfig=ep?.providerId==='snowluma'?snowluma.data?.onebot?.config:ep?.providerId==='llbot'?llbot.data?.onebot?.config:napcat.data?.onebot?.config;
   useEffect(()=>{
     if(wsConfig&&!wsDirtyRef.current){
       setClients(wsConfig.websocketClients??[]);
@@ -114,10 +117,10 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   async function saveWs(){
     await run('ws',async()=>{
       const clean=<T extends {tokenConfigured?:boolean}>(value:T)=>{const next={...value};delete next.tokenConfigured;return next};
-      const wsPath=ep?.providerId==='snowluma'?`/endpoints/${id}/snowluma/onebot/websockets`:`/endpoints/${id}/napcat/onebot/websockets`;
+      const wsPath=ep?.providerId==='snowluma'?`/endpoints/${id}/snowluma/onebot/websockets`:ep?.providerId==='llbot'?`/endpoints/${id}/llbot/onebot/websockets`:`/endpoints/${id}/napcat/onebot/websockets`;
       const op=await api.mutate<Operation>(wsPath,{websocketClients:clients.map(clean),websocketServers:servers.map(clean)},'PUT');
       await wait(op,'WebSocket configuration failed');
-      await Promise.all([ep?.providerId==='snowluma'?snowluma.refresh():napcat.refresh(),q.refresh()]);
+      await Promise.all([ep?.providerId==='snowluma'?snowluma.refresh():ep?.providerId==='llbot'?llbot.refresh():napcat.refresh(),q.refresh()]);
       wsDirtyRef.current=false;
       setWsDirty(false);
     });
@@ -152,8 +155,8 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   }
 
   const settings=<EndpointSettings endpoint={endpoint} refresh={q.refresh} canDelete={deleteAvailability.visible} deleteDisabled={deleteAvailability.disabled||Boolean(busy)} deleting={busy==='delete'} onDelete={deleteCurrentEndpoint}/>;
-  const statusRefreshing=napcat.refreshing||snowluma.refreshing;
-  const refreshStatus=async()=>{await Promise.all([q.refresh(),...(canOperate&&endpoint.providerId==='napcat'?[napcat.refresh()]:[]),...(canOperate&&endpoint.providerId==='snowluma'?[snowluma.refresh()]:[])])};
+  const statusRefreshing=napcat.refreshing||snowluma.refreshing||llbot.refreshing;
+  const refreshStatus=async()=>{await Promise.all([q.refresh(),...(canOperate&&endpoint.providerId==='napcat'?[napcat.refresh()]:[]),...(canOperate&&endpoint.providerId==='snowluma'?[snowluma.refresh()]:[]),...(canOperate&&endpoint.providerId==='llbot'?[llbot.refresh()]:[])])};
   const lifecycleActions=<div className="endpoint-lifecycle-actions" aria-label={t('endpoint.lifecycle')}><Button className="endpoint-refresh-action" variant="outline" aria-label={t('endpoint.refreshStatus')} disabled={q.refreshing||statusRefreshing||Boolean(busy)} onClick={()=>void refreshStatus()}><RefreshCw className={q.refreshing||statusRefreshing?'refresh-spin':undefined}/><span className="refresh-label">{q.refreshing||statusRefreshing?t('common.refreshing'):t('common.refresh')}</span></Button>{['start','stop','restart'].map(action=>{const availability=actionAvailability(action,{permissions:session.permissions,capabilities:session.capabilities,activeOperationId:endpoint.activeOperationId});return availability.visible&&<Button key={action} variant={action==='start'?'default':'outline'} busy={busy===`lifecycle-${action}`} disabled={availability.disabled||Boolean(busy)} onClick={()=>run(`lifecycle-${action}`,async()=>{const operation=await api.mutate<Operation>(`/endpoints/${endpoint.id}/operations`,{action,expectedGeneration:endpoint.generation});navigate(`/operations/${operation.id}`)})}>{action==='start'?t('endpoint.start'):action==='stop'?t('endpoint.stop'):t('endpoint.restart')}</Button>})}{forceRestartAvailability.visible?<Button variant="outline" disabled={forceRestartAvailability.disabled||Boolean(busy)} onClick={()=>{setForceRestartError(undefined);setConfirmForceRestart(true)}}>{t('endpoint.forceRestart')}</Button>:null}</div>;
   const probeCatalog=[
     ['get_status',t('endpoint.probeRuntime')],
@@ -165,10 +168,10 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   const directoryData=onebot?.directory;
   const currentDirectory=directoryData?.[directory];
   const probeRows=probeCatalog.map(([action,category])=>{const probe=onebot?.probes?.[action];return [<code>{action}</code>,category,probe?<Badge good={probe.ok}>{probe.ok?t('endpoint.probeAvailable'):t('endpoint.probeFailed')}</Badge>:<Badge>{t('endpoint.notObserved')}</Badge>,probe?`${probe.durationMs} ms${probe.error?` · ${probe.error}`:''}`:'—']});
-  const hasTabbedConsole=canOperate&&(endpoint.providerId==='napcat'||endpoint.providerId==='snowluma');
+  const hasTabbedConsole=canOperate&&(endpoint.providerId==='napcat'||endpoint.providerId==='snowluma'||endpoint.providerId==='llbot');
 
   return <Stack className={`endpoint-console${hasTabbedConsole?' endpoint-console-with-tabs':''}`}>
-    <PageHeading className="endpoint-heading" kicker={t('endpoint.kicker',{driver:endpoint.providerId==='snowluma'?'SnowLuma':'NapCat'})} title={endpoint.name} description={t('endpoint.hostedBy',{node:endpoint.node?.name??t('endpoint.unassignedNode'),id:endpoint.id})} action={lifecycleActions}/>
+    <PageHeading className="endpoint-heading" kicker={t('endpoint.kicker',{driver:endpoint.providerId==='snowluma'?'SnowLuma':endpoint.providerId==='llbot'?'LLBot':'NapCat'})} title={endpoint.name} description={t('endpoint.hostedBy',{node:endpoint.node?.name??t('endpoint.unassignedNode'),id:endpoint.id})} action={lifecycleActions}/>
     <div className="health-strip">{statusLayers(endpoint.status).map(layer=><Info key={layer.label} label={t(layer.id as MessageKey)}><Badge good={['connected','online','ready','available','converged'].includes(layer.value)}>{layer.value}</Badge></Info>)}</div>
     {endpoint.activeOperation?<OperationProgressView operation={endpoint.activeOperation}/>:null}
     <Modal open={confirmForceRestart} onClose={closeForceRestart} title={t('endpoint.forceRestart')} description={t('endpoint.forceRestartDescription')} footer={<><Button variant="outline" disabled={busy==='force-restart'} onClick={closeForceRestart}>{t('common.cancel')}</Button><Button variant="destructive" busy={busy==='force-restart'} disabled={Boolean(busy)||!forceRestartAvailability.visible||forceRestartAvailability.disabled} onClick={()=>void forceRestart()}>{t('endpoint.forceRestart')}</Button></>}>
@@ -186,24 +189,55 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
         <TabsTrigger className="product-tabs-trigger after:hidden" value="settings">{t('endpoint.tabSettings')}</TabsTrigger>
       </TabsList>
       <TabsContent value="overview" className="endpoint-tab-panel">
-        <Card className="qq-account-card"><div className="card-section-heading"><div><h2>{t('endpoint.qqAccount')}</h2><p className="muted">{t('endpoint.qqAccountHint')}</p></div>{loggedIn&&<Badge good>{t('endpoint.loggedIn')}</Badge>}</div>{loggedIn?<div className="info-grid"><Info label={t('endpoint.nickname')}>{String(qq?.nickname??qq?.nick??onebot?.loginInfo?.nickname??t('endpoint.qqAccountFallback'))}</Info><Info label={t('endpoint.qqNumber')}>{String(qq?.uin??qq?.uid??onebot?.loginInfo?.user_id??'—')}</Info></div>:endpoint.providerId==='snowluma'?<SnowlumaLoginPanel endpointId={id} guide={snowluma.data?.loginGuide}/>:<div className="qq-login-panel"><div className="endpoint-qr">{qr.data?.qrcode?<QRCodeSVG value={qr.data.qrcode} size={184} role="img" aria-label={t('endpoint.qrAria')}/>:<span>{t('endpoint.waitingQr')}</span>}</div><div className="qq-login-copy"><h3>{t('endpoint.scanTitle')}</h3><p className="muted">{t('endpoint.scanBody')}</p><Button busy={busy==='qr'} disabled={Boolean(endpoint.activeOperationId)} onClick={()=>run('qr',async()=>{await wait(await api.mutate<Operation>(`/endpoints/${id}/napcat/login-qrcode`),t('operation.qrFailed'));await Promise.all([qr.refresh(),napcat.refresh(),q.refresh()])})}>{t('endpoint.refreshQr')}</Button></div></div>}</Card>
+        <Card className="qq-account-card"><div className="card-section-heading"><div><h2>{t('endpoint.qqAccount')}</h2><p className="muted">{t('endpoint.qqAccountHint')}</p></div>{loggedIn&&<Badge good>{t('endpoint.loggedIn')}</Badge>}</div>{loggedIn?<div className="info-grid"><Info label={t('endpoint.nickname')}>{String(qq?.nickname??qq?.nick??onebot?.loginInfo?.nickname??t('endpoint.qqAccountFallback'))}</Info><Info label={t('endpoint.qqNumber')}>{String(qq?.uin??qq?.uid??onebot?.loginInfo?.user_id??'—')}</Info></div>:endpoint.providerId==='snowluma'?<SnowlumaLoginPanel endpointId={id} guide={snowluma.data?.loginGuide}/>:endpoint.providerId==='llbot'?<LLBotLoginPanel endpointId={id} guide={llbot.data?.loginGuide}/>:<div className="qq-login-panel"><div className="endpoint-qr">{qr.data?.qrcode?<QRCodeSVG value={qr.data.qrcode} size={184} role="img" aria-label={t('endpoint.qrAria')}/>:<span>{t('endpoint.waitingQr')}</span>}</div><div className="qq-login-copy"><h3>{t('endpoint.scanTitle')}</h3><p className="muted">{t('endpoint.scanBody')}</p><Button busy={busy==='qr'} disabled={Boolean(endpoint.activeOperationId)} onClick={()=>run('qr',async()=>{await wait(await api.mutate<Operation>(`/endpoints/${id}/napcat/login-qrcode`),t('operation.qrFailed'));await Promise.all([qr.refresh(),napcat.refresh(),q.refresh()])})}>{t('endpoint.refreshQr')}</Button></div></div>}</Card>
       </TabsContent>
       <TabsContent value="traffic" className="endpoint-tab-panel"><TrafficPanel traffic={traffic} freshness={providerFreshness} requestFailed={providerRequestFailed}/></TabsContent>
       <TabsContent value="qq-data" className="endpoint-tab-panel">
         <Card><div className="card-section-heading"><div><h2>{t('endpoint.qqData')}</h2><p className="muted">{t('endpoint.qqDataHint')}</p></div>{currentDirectory?.observedAt?<small className="muted">{t('endpoint.observed',{time:new Date(currentDirectory.observedAt).toLocaleString(locale)})}</small>:null}</div><Tabs value={directory} onValueChange={value=>setDirectory(value as 'friends'|'groups')}><TabsList className="product-tabs-list"><TabsTrigger className="product-tabs-trigger after:hidden" value="friends">{t('endpoint.friends',{count:directoryData?.friends.count??0})}</TabsTrigger><TabsTrigger className="product-tabs-trigger after:hidden" value="groups">{t('endpoint.groups',{count:directoryData?.groups.count??0})}</TabsTrigger></TabsList>{currentDirectory&&!currentDirectory.probe.ok?<div className="alert error" role="status">{t('endpoint.refreshFailed')}{currentDirectory.observedAt?t('endpoint.refreshFailedCached'):''}. {currentDirectory.probe.error}</div>:null}{currentDirectory?.truncated?<p className="muted">{t('endpoint.showingFirst',{shown:currentDirectory.items.length,total:currentDirectory.count})}</p>:null}<TabsContent value="friends">{directoryData?.friends.items.length?<DirectoryTable key="friends" headers={[t('endpoint.colNickname'),t('endpoint.colRemark'),t('endpoint.colQq')]} items={directoryData.friends.items} total={directoryData.friends.count} truncated={directoryData.friends.truncated} row={friend=>[String(friend.nickname??'—'),String(friend.remark??'—'),String(friend.user_id)]}/>:<Empty name={t('endpoint.emptyFriends')}/>}</TabsContent><TabsContent value="groups">{directoryData?.groups.items.length?<DirectoryTable key="groups" headers={[t('endpoint.colGroup'),t('endpoint.colMembers'),t('endpoint.colId')]} items={directoryData.groups.items} total={directoryData.groups.count} truncated={directoryData.groups.truncated} row={group=>[String(group.group_name??'—'),String(group.member_count??'—'),String(group.group_id)]}/>:<Empty name={t('endpoint.emptyGroups')}/>}</TabsContent></Tabs></Card>
       </TabsContent>
       <TabsContent value="onebot" className="endpoint-tab-panel">
-        <Card className="protocol-runtime"><div><h2>{t('endpoint.onebotTitle')}</h2><p>{t('endpoint.onebotBody')}</p></div><div className="runtime-facts"><Info label={t('endpoint.implementation')}>{String(onebot?.version?.app_name??(endpoint.providerId==='snowluma'?'SnowLuma':'NapCat'))}</Info><Info label={t('endpoint.implementationVersion')}>{String(onebot?.version?.app_version??t('endpoint.awaitingReport'))}</Info></div></Card>
+        <Card className="protocol-runtime"><div><h2>{t('endpoint.onebotTitle')}</h2><p>{t('endpoint.onebotBody')}</p></div><div className="runtime-facts"><Info label={t('endpoint.implementation')}>{String(onebot?.version?.app_name??(endpoint.providerId==='snowluma'?'SnowLuma':endpoint.providerId==='llbot'?'LLBot':'NapCat'))}</Info><Info label={t('endpoint.implementationVersion')}>{String(onebot?.version?.app_version??t('endpoint.awaitingReport'))}</Info></div></Card>
         <Card><div className="card-section-heading"><div><h2>{t('endpoint.actionSupport')}</h2><p className="muted">{t('endpoint.actionSupportHint')}</p></div></div><Table headers={[t('endpoint.colAction'),t('endpoint.colLayer'),t('endpoint.colAvailability'),t('endpoint.colLatestProbe')]} rows={probeRows}/></Card>
       </TabsContent>
       <TabsContent value="connections" className="endpoint-tab-panel">
-        {endpoint.providerId==='snowluma'&&!loggedIn?<Card><PageHeading kicker={t('endpoint.wsKicker')} title={t('endpoint.wsTitle')} description={t('endpoint.wsDescription')}/><p className="muted">{t('endpoint.snowlumaWsHint')}</p></Card>:<Card className="ws-transport-card"><PageHeading kicker={t('endpoint.wsKicker')} title={t('endpoint.wsTitle')} description={endpoint.providerId==='snowluma'?t('endpoint.snowlumaWsEditorHint'):t('endpoint.wsDescription')}/><fieldset className="ws-editor-fieldset" disabled={busy==='ws'}><WebSocketConnectionEditor clients={clients} servers={servers} onClientsChange={markClients} onServersChange={markServers}/></fieldset><footer className="ws-save-bar"><p>{wsDirty?t('endpoint.wsDirty'):t('endpoint.wsClean')}</p><div className="ws-save-actions"><Button variant="outline" disabled={!wsDirty||busy==='ws'} onClick={discardWs}>{t('common.discardChanges')}</Button><Button busy={busy==='ws'} disabled={Boolean(endpoint.activeOperationId)||!wsDirty} onClick={saveWs}>{t('common.saveChanges')}</Button></div></footer></Card>}
+        {endpoint.providerId==='llbot'&&!loggedIn?<Card><PageHeading kicker={t('endpoint.wsKicker')} title={t('endpoint.wsTitle')} description={t('endpoint.wsDescription')}/><p className="muted">{t('endpoint.llbotWsHint')}</p></Card>:endpoint.providerId==='snowluma'&&!loggedIn?<Card><PageHeading kicker={t('endpoint.wsKicker')} title={t('endpoint.wsTitle')} description={t('endpoint.wsDescription')}/><p className="muted">{t('endpoint.snowlumaWsHint')}</p></Card>:<Card className="ws-transport-card"><PageHeading kicker={t('endpoint.wsKicker')} title={t('endpoint.wsTitle')} description={endpoint.providerId==='snowluma'?t('endpoint.snowlumaWsEditorHint'):endpoint.providerId==='llbot'?t('endpoint.llbotWsEditorHint'):t('endpoint.wsDescription')}/><fieldset className="ws-editor-fieldset" disabled={busy==='ws'}><WebSocketConnectionEditor clients={clients} servers={servers} onClientsChange={markClients} onServersChange={markServers}/></fieldset><footer className="ws-save-bar"><p>{wsDirty?t('endpoint.wsDirty'):t('endpoint.wsClean')}</p><div className="ws-save-actions"><Button variant="outline" disabled={!wsDirty||busy==='ws'} onClick={discardWs}>{t('common.discardChanges')}</Button><Button busy={busy==='ws'} disabled={Boolean(endpoint.activeOperationId)||!wsDirty} onClick={saveWs}>{t('common.saveChanges')}</Button></div></footer></Card>}
       </TabsContent>
-      <TabsContent value="logs" className="endpoint-tab-panel"><Card><h2>{t('endpoint.logsTitle')}</h2><p className="muted">{t('endpoint.logsHint')}</p><Button busy={busy==='logs'} disabled={Boolean(endpoint.activeOperationId)} onClick={()=>run('logs',async()=>{const current=await wait(await api.mutate<Operation>(`/endpoints/${id}/${endpoint.providerId==='snowluma'?'snowluma':'napcat'}/container-logs`,{tail:250,sinceSeconds:900}),t('operation.logsFailed'));setLogs((current.result as {metadata?:{logs?:{text?:string}}})?.metadata?.logs?.text??t('endpoint.noLogs'))})}>{t('endpoint.loadLogs')}</Button>{logs!==undefined&&<pre>{logs}</pre>}</Card></TabsContent>
+      <TabsContent value="logs" className="endpoint-tab-panel"><Card><h2>{t('endpoint.logsTitle')}</h2><p className="muted">{t('endpoint.logsHint')}</p><Button busy={busy==='logs'} disabled={Boolean(endpoint.activeOperationId)} onClick={()=>run('logs',async()=>{const current=await wait(await api.mutate<Operation>(`/endpoints/${id}/${endpoint.providerId==='snowluma'?'snowluma':endpoint.providerId==='llbot'?'llbot':'napcat'}/container-logs`,{tail:250,sinceSeconds:900}),t('operation.logsFailed'));setLogs((current.result as {metadata?:{logs?:{text?:string}}})?.metadata?.logs?.text??t('endpoint.noLogs'))})}>{t('endpoint.loadLogs')}</Button>{logs!==undefined&&<pre>{logs}</pre>}</Card></TabsContent>
       <TabsContent value="settings" className="endpoint-tab-panel">{settings}</TabsContent>
     </Tabs>:settings}
     {error?<Failure error={error}/>:null}
   </Stack>;
+}
+
+// Deterministic per-endpoint WebUI port; must match llbotLoginPorts in apps/agent.
+const llbotWebuiPortFallback=(endpointId:string)=>({webuiPort:3080+Number.parseInt(endpointId.slice(0,4),16)%400});
+function LLBotLoginPanel({endpointId,guide}:{endpointId:string;guide?:LLBotLoginGuide|null}){
+  const{t}=useI18n();
+  const[expanded,setExpanded]=useState(false);
+  const fallback=llbotWebuiPortFallback(endpointId);
+  const webuiPort=guide?.webuiPort??fallback.webuiPort;
+  const webuiUrl=`http://${window.location.hostname}:${webuiPort}/`;
+  useEffect(()=>{
+    if(!expanded)return;
+    const previous=document.body.style.overflow;
+    document.body.style.overflow='hidden';
+    const onKey=(event:KeyboardEvent)=>{if(event.key==='Escape')setExpanded(false)};
+    window.addEventListener('keydown',onKey);
+    return()=>{document.body.style.overflow=previous;window.removeEventListener('keydown',onKey)};
+  },[expanded]);
+  const iframe=<iframe className="snowluma-novnc-frame" src={webuiUrl} title={t('endpoint.llbotWebui')} allow="clipboard-read; clipboard-write"/>;
+  return <div className="qq-login-panel snowluma-login-panel">
+    <div className="qq-login-copy">
+      <h3>{t('endpoint.llbotLoginTitle')}</h3>
+      <p className="muted">{t('endpoint.llbotLoginHint')}</p>
+      <div className="snowluma-login-actions">
+        <Button variant="outline" onClick={()=>setExpanded(true)}>{t('endpoint.llbotExpand')}</Button>
+        <Button variant="outline" onClick={()=>window.open(webuiUrl,"_blank","noopener")}>{t('endpoint.llbotWebui')}</Button>
+      </div>
+      <p className="muted">{t('endpoint.llbotWebuiHint')}</p>
+    </div>
+    {expanded?<div className="snowluma-novnc-overlay"><div className="snowluma-novnc-overlay-bar"><strong>{t('endpoint.llbotWebui')}</strong><Button variant="outline" onClick={()=>setExpanded(false)}>{t('common.close')}</Button></div>{iframe}</div>:iframe}
+  </div>;
 }
 
 // Deterministic per-endpoint login ports; must match snowlumaLoginPorts in apps/agent

@@ -16,7 +16,7 @@ import {
 import { applyProxyEnvironment } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator } from "./traffic.js";
 import { SnowLumaRuntime, SNOWLUMA_IMAGE } from "./snowluma-runtime.js";
-import { LLBotRuntime, LLBOT_IMAGE } from "./llbot-runtime.js";
+import { LLBotRuntime } from "./llbot-runtime.js";
 import type { RuntimeDriver, RuntimeSpec } from './runtime/types.js';
 import { resolveRuntimeBackend } from './runtime/config.js';
 import { KubernetesRuntimeDriver } from './runtime/kubernetes.js';
@@ -340,7 +340,7 @@ export class HttpAgentTransport implements AgentCommandTransport {
     });
   }
   async claim() {
-    const response = await this.request<{ command: unknown }>("/api/v1/agent/commands/claim", { limit: 1 });
+    const response = await this.request<{ command: unknown }>("/api/v1/agent/commands/claim", { limit: 1, providerRouting: true });
     return response.command ? RuntimeCommandSchema.parse(response.command) : null;
   }
   async receipt(commandId: string, receipt: { operationId: string; generation: number; connectionEpoch: number }) {
@@ -1047,10 +1047,11 @@ export class DurableFakeAgent {
   }
   private async collectObservations(): Promise<NonNullable<Parameters<AgentCommandTransport["heartbeat"]>[0]>> {
     const active = [...this.runtimes.values()].filter(runtime => runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime || runtime instanceof LLBotRuntime);
-    const observations = (await Promise.all(active.map(async runtime => {
+    // Every endpoint must be reported each cycle — no truncation. The heartbeat schema
+    // caps a single request at 200 entries, so callers batch the full list.
+    return (await Promise.all(active.map(async runtime => {
       try { return await runtime.observations(); } catch { return []; }
     }))).flat();
-    return observations.slice(0, 200);
   }
   async pollOnce(): Promise<boolean> {
     // Keep command polling responsive without rewriting full telemetry every tick.
@@ -1064,7 +1065,7 @@ export class DurableFakeAgent {
     if (!command) {
       if(observationDue&&this.runtimes.size){
         const observations=await this.collectObservations();
-        if(observations.length)await this.transport.heartbeat(observations);
+        for(let index=0;index<observations.length;index+=200)await this.transport.heartbeat(observations.slice(index,index+200));
       }
       return false;
     }
@@ -1217,21 +1218,29 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
       ...(signal === undefined ? {} : { signal }),
       ...(process.env.NAPCAT_TOKEN === undefined ? {} : { napcatToken: process.env.NAPCAT_TOKEN }),
     });
-    if (target === "snowluma") return new SnowLumaRuntime({
-      docker: new DockerCliClient(),
-      stateDirectory: join(nodeStateDir, "snowluma"),
-      hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
-      ...(signal === undefined ? {} : { signal }),
-      ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
-    });
-    if (target === "llbot") return new LLBotRuntime({
-      docker: new DockerCliClient(),
-      stateDirectory: join(nodeStateDir, "llbot"),
-      hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
-      ...(signal === undefined ? {} : { signal }),
-      ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
-      ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
-    });
+    if (target === "snowluma") {
+      // SnowLuma drives containers through the Docker API surface (exec, published
+      // ports, host bind mounts); there is no Kubernetes-backed DockerClient yet.
+      if (backend === "kubernetes") throw new Error("SnowLuma runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      return new SnowLumaRuntime({
+        docker: new DockerCliClient(),
+        stateDirectory: join(nodeStateDir, "snowluma"),
+        hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
+        ...(signal === undefined ? {} : { signal }),
+        ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
+      });
+    }
+    if (target === "llbot") {
+      if (backend === "kubernetes") throw new Error("LLBot runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      return new LLBotRuntime({
+        docker: new DockerCliClient(),
+        stateDirectory: join(nodeStateDir, "llbot"),
+        hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
+        ...(signal === undefined ? {} : { signal }),
+        ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
+        ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
+      });
+    }
     if (target === "fake") return FakeRuntime.open(join(nodeStateDir,"runtime-effects.json"));
     return null;
   };

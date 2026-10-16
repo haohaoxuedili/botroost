@@ -17,8 +17,8 @@ describe("notification durability schema",()=>{
     const sql=await readFile(new URL("../migrations/0005_napcat_notifications.sql",import.meta.url),"utf8");
     expect(sql).toMatch(/^BEGIN;[\s\S]*COMMIT;\n$/);
   });
-  it("does not lock endpoint rows while reconciling notification state",()=>{
-    expect(PostgresDatabase.prototype.reconcileEndpointNotifications.toString()).not.toContain("FOR UPDATE OF e");
+  it("serializes concurrent reconciliation by locking endpoint rows",()=>{
+    expect(PostgresDatabase.prototype.reconcileEndpointNotifications.toString()).toContain("FOR UPDATE OF e");
   });
   it("stores named targets, endpoint subscriptions, and defaults in a dedicated migration",()=>{for(const fragment of ["0014_alert_subscriptions","notification_targets","workspace_notification_defaults","endpoint_notification_subscriptions","endpoint.offline","endpoint.recovery","DROP COLUMN sender"])expect(migrationSql).toContain(fragment)});
   it("stores QQ login incidents in a policy-specific table and scans protocol endpoints",()=>{

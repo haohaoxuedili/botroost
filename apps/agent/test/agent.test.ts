@@ -75,6 +75,32 @@ describe("durable fake agent", () => {
     const agent=await DurableFakeAgent.open({journalPath:join(dir,"journal"),runtime,transport});
     try{await expect(agent.pollOnce()).resolves.toBe(true);expect(observe).not.toHaveBeenCalled();expect(transport.results).toHaveLength(1)}finally{await agent.close()}
   });
+  it("routes commands tagged with a provider to a lazily created runtime",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"agent-multi-runtime-"));
+    const napcat=new FakeRuntime(),snowluma=new FakeRuntime();
+    const napcatApply=vi.spyOn(napcat,"apply"),snowlumaApply=vi.spyOn(snowluma,"apply");
+    const factory=vi.fn(async(provider:string)=>provider==="snowluma"?snowluma:null);
+    const transport=new MemoryTransport({...command,metadata:{provider:"snowluma"}});
+    const agent=await DurableFakeAgent.open({journalPath:join(dir,"journal"),runtime:napcat,runtimeFactory:factory,transport});
+    try{await agent.pollOnce();expect(factory).toHaveBeenCalledWith("snowluma");expect(snowlumaApply).toHaveBeenCalled();expect(napcatApply).not.toHaveBeenCalled();expect(transport.results[0]).toMatchObject({outcome:"succeeded"})}finally{await agent.close()}
+  });
+  it("fails a command cleanly when no runtime is available for its provider",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"agent-runtime-missing-"));
+    const napcat=new FakeRuntime();
+    const napcatApply=vi.spyOn(napcat,"apply");
+    const transport=new MemoryTransport({...command,metadata:{provider:"snowluma"}});
+    const agent=await DurableFakeAgent.open({journalPath:join(dir,"journal"),runtime:napcat,runtimeFactory:async()=>null,transport});
+    try{await agent.pollOnce();expect(napcatApply).not.toHaveBeenCalled();expect(transport.results[0]).toMatchObject({outcome:"failed"});expect(JSON.stringify(transport.results)).toContain("snowluma")}finally{await agent.close()}
+  });
+  it("applies legacy commands without a provider tag to the default runtime",async()=>{
+    const dir=await mkdtemp(join(tmpdir(),"agent-legacy-command-"));
+    const napcat=new FakeRuntime();
+    const napcatApply=vi.spyOn(napcat,"apply");
+    const factory=vi.fn(async()=>{throw new Error("factory must not be consulted for legacy commands")});
+    const transport=new MemoryTransport(command);
+    const agent=await DurableFakeAgent.open({journalPath:join(dir,"journal"),runtime:napcat,runtimeFactory:factory,transport});
+    try{await agent.pollOnce();expect(factory).not.toHaveBeenCalled();expect(napcatApply).toHaveBeenCalled();expect(transport.results[0]).toMatchObject({outcome:"succeeded"})}finally{await agent.close()}
+  });
   it("redacts process invocation secrets from persisted terminal failures",async()=>{
     const dir=await mkdtemp(join(tmpdir(),"agent-failure-redaction-")),runtime=new FakeRuntime();
     runtime.apply=async()=>{throw Object.assign(new Error("command failed docker --env TOKEN=secret"),{stderr:"TOKEN=secret",cmd:"docker"})};

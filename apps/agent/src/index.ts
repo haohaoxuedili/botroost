@@ -16,6 +16,7 @@ import {
 import { applyProxyEnvironment } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator } from "./traffic.js";
 import { SnowLumaRuntime, SNOWLUMA_IMAGE } from "./snowluma-runtime.js";
+import { LLBotRuntime, LLBOT_IMAGE } from "./llbot-runtime.js";
 import type { RuntimeDriver, RuntimeSpec } from './runtime/types.js';
 import { resolveRuntimeBackend } from './runtime/config.js';
 import { KubernetesRuntimeDriver } from './runtime/kubernetes.js';
@@ -991,8 +992,8 @@ export class NapCatRuntime {
   }
 }
 
-type AgentRuntime = FakeRuntime | NapCatRuntime | SnowLumaRuntime;
-const knownProviders = ["fake", "napcat", "snowluma"] as const;
+type AgentRuntime = FakeRuntime | NapCatRuntime | SnowLumaRuntime | LLBotRuntime;
+const knownProviders = ["fake", "napcat", "snowluma", "llbot"] as const;
 
 export class DurableFakeAgent {
   private lastObservationHeartbeatAt=Number.NEGATIVE_INFINITY;
@@ -1006,7 +1007,7 @@ export class DurableFakeAgent {
     runtimeFactory?: (provider: string) => Promise<AgentRuntime | null>,
     defaultProvider?: string,
   ) {
-    this.defaultProvider = defaultProvider ?? (runtime instanceof NapCatRuntime ? "napcat" : runtime instanceof SnowLumaRuntime ? "snowluma" : "fake");
+    this.defaultProvider = defaultProvider ?? (runtime instanceof NapCatRuntime ? "napcat" : runtime instanceof SnowLumaRuntime ? "snowluma" : runtime instanceof LLBotRuntime ? "llbot" : "fake");
     if (runtime) this.runtimes.set(this.defaultProvider, runtime);
     else if (!runtimeFactory) this.runtimes.set(this.defaultProvider, new FakeRuntime());
     this.runtimeFactory = runtimeFactory;
@@ -1045,7 +1046,7 @@ export class DurableFakeAgent {
     return created;
   }
   private async collectObservations(): Promise<NonNullable<Parameters<AgentCommandTransport["heartbeat"]>[0]>> {
-    const active = [...this.runtimes.values()].filter(runtime => runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime);
+    const active = [...this.runtimes.values()].filter(runtime => runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime || runtime instanceof LLBotRuntime);
     const observations = (await Promise.all(active.map(async runtime => {
       try { return await runtime.observations(); } catch { return []; }
     }))).flat();
@@ -1119,9 +1120,9 @@ export class DurableFakeAgent {
       if (!result) {
         const runtime = await this.runtimeFor(command);
         const effectId=`runtime:${command.commandId}`;
-        let applied = this.journal.get(command.commandId)?.effects[effectId] as Awaited<ReturnType<NapCatRuntime["apply"] | SnowLumaRuntime["apply"]>> | undefined;
+        let applied = this.journal.get(command.commandId)?.effects[effectId] as Awaited<ReturnType<NapCatRuntime["apply"] | SnowLumaRuntime["apply"] | LLBotRuntime["apply"]>> | undefined;
         if (!applied)
-          applied = runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime
+          applied = runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime || runtime instanceof LLBotRuntime
             ? await runtime.apply(effectId,command,report,commandAbort.signal)
             : await runtime.apply(effectId,command,report);
         if(fenceError)throw fenceError;
@@ -1194,7 +1195,7 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
   if (!controlPlaneUrl || !nodeStateDir)
     throw new Error("CONTROL_PLANE_URL and NODE_STATE_DIR are required");
   const provider = process.env.AGENT_PROVIDER ?? "fake";
-  if (!["fake", "napcat", "snowluma"].includes(provider)) throw new Error("AGENT_PROVIDER must be fake, napcat or snowluma");
+  if (!["fake", "napcat", "snowluma", "llbot"].includes(provider)) throw new Error("AGENT_PROVIDER must be fake, napcat, snowluma or llbot");
   const store = new NodeCredentialStore(nodeStateDir);
   let credential = await store.read();
   if (!credential) {
@@ -1222,6 +1223,14 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
       hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
       ...(signal === undefined ? {} : { signal }),
       ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
+    });
+    if (target === "llbot") return new LLBotRuntime({
+      docker: new DockerCliClient(),
+      stateDirectory: join(nodeStateDir, "llbot"),
+      hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
+      ...(signal === undefined ? {} : { signal }),
+      ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
+      ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
     });
     if (target === "fake") return FakeRuntime.open(join(nodeStateDir,"runtime-effects.json"));
     return null;

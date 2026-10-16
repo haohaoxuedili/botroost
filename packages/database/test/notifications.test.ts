@@ -26,7 +26,7 @@ describe("notification durability schema",()=>{
     expect(migrationSql).toContain("CREATE TABLE qq_login_notification_state");
     const source=PostgresDatabase.prototype.reconcileEndpointNotifications.toString();
     expect(source).toContain("qq_login_notification_state");
-    expect(source).toContain("provider_id IN ('napcat','snowluma')");
+    expect(source).toContain("provider_id IN ('napcat','snowluma','llbot')");
   });
   it("ships migrations that permit OneBot websocket updates and durable endpoint deletion",()=>{
     expect(migrationSql).toContain("0008_onebot_websocket_management");

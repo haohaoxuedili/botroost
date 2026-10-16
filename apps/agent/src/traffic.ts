@@ -26,7 +26,7 @@ export interface ProtocolTrafficWindow {
 }
 
 export interface ProtocolTrafficSummary {
-  source: "napcat.container_logs" | "snowluma.container_logs";
+  source: "napcat.container_logs" | "snowluma.container_logs" | "llbot.container_logs";
   privacy: "aggregate_only";
   observedAt: string;
   oneMinute: ProtocolTrafficWindow;
@@ -208,4 +208,55 @@ export class NapCatTrafficAccumulator {
     this.connections = this.connections.filter(event => new Date(event.at).getTime() >= cutoff);
     for (const [id, at] of this.seen) if (at < cutoff) this.seen.delete(id);
   }
+}
+
+/** LLBot emits OneBot traffic as `[收-群]`/`[发-群]` (or 私聊) core log lines. */
+export function parseLLBotTrafficLine(line: string): ProtocolTrafficEvent | null {
+  const matched = dockerTimestamp.exec(line.trim());
+  if (!matched) return null;
+  const [, rawTimestamp, message = ""] = matched;
+  const inbound = message.includes("[收-") || message.includes("收到");
+  const outbound = message.includes("[发-") || message.includes("发送");
+  if (!inbound && !outbound) return null;
+  const timestamp = new Date(rawTimestamp!);
+  if (!Number.isFinite(timestamp.getTime())) return null;
+  return {
+    id: createHash("sha256").update(line).digest("hex"),
+    at: timestamp.toISOString(),
+    direction: inbound ? "inbound" : "outbound",
+    scope: message.includes("群") ? "group" : message.includes("私聊") ? "private" : "unknown",
+    bytes: Buffer.byteLength(message, "utf8"),
+  };
+}
+
+/** LLBot adapter lifecycle lines, e.g. `onebot11-adapter WebSocket 事件上报 ws://…`,
+ *  `收到反向 Websocket 消息` and `正向 WebSocket 服务已启动`. */
+export function parseLLBotConnectionLine(line: string): ProtocolConnectionEvent | null {
+  const matched = dockerTimestamp.exec(line.trim());
+  if (!matched) return null;
+  const [, rawTimestamp, rawMessage = ""] = matched;
+  const message = stripAnsiColor(rawMessage);
+  const client = /事件上报|反向\s*WebSocket|反向WebSocket|ws-reverse/i.test(message);
+  const server = /正向\s*WebSocket|WebSocket\s*服务|监听|listening/i.test(message);
+  if (!client && !server) return null;
+  const timestamp = new Date(rawTimestamp!);
+  if (!Number.isFinite(timestamp.getTime())) return null;
+  const status = /重新连接|reconnect/i.test(message)
+    ? "reconnecting"
+    : /断开|关闭|disconnect/i.test(message)
+      ? "disconnected"
+      : /错误|失败|error/i.test(message)
+        ? "error"
+        : /连接成功|已连接|connected|事件上报/i.test(message)
+          ? "connected"
+          : /已启动|listening|监听/i.test(message)
+            ? "listening"
+            : null;
+  if (!status) return null;
+  return {
+    id: createHash("sha256").update(line).digest("hex"),
+    at: timestamp.toISOString(),
+    transport: client ? "websocket-client" : "websocket-server",
+    status,
+  };
 }

@@ -16,7 +16,7 @@ import {
 import { applyProxyEnvironment } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator } from "./traffic.js";
 import { SnowLumaRuntime, SNOWLUMA_IMAGE } from "./snowluma-runtime.js";
-import { LLBotRuntime, LLBOT_IMAGE } from "./llbot-runtime.js";
+import { LLBotRuntime } from "./llbot-runtime.js";
 import type { RuntimeDriver, RuntimeSpec } from './runtime/types.js';
 import { resolveRuntimeBackend } from './runtime/config.js';
 import { KubernetesRuntimeDriver } from './runtime/kubernetes.js';
@@ -340,7 +340,7 @@ export class HttpAgentTransport implements AgentCommandTransport {
     });
   }
   async claim() {
-    const response = await this.request<{ command: unknown }>("/api/v1/agent/commands/claim", { limit: 1 });
+    const response = await this.request<{ command: unknown }>("/api/v1/agent/commands/claim", { limit: 1, providerRouting: true });
     return response.command ? RuntimeCommandSchema.parse(response.command) : null;
   }
   async receipt(commandId: string, receipt: { operationId: string; generation: number; connectionEpoch: number }) {
@@ -992,23 +992,66 @@ export class NapCatRuntime {
   }
 }
 
+type AgentRuntime = FakeRuntime | NapCatRuntime | SnowLumaRuntime | LLBotRuntime;
+const knownProviders = ["fake", "napcat", "snowluma", "llbot"] as const;
+
 export class DurableFakeAgent {
   private lastObservationHeartbeatAt=Number.NEGATIVE_INFINITY;
+  private readonly runtimes = new Map<string, AgentRuntime>();
+  private readonly runtimeFactory: ((provider: string) => Promise<AgentRuntime | null>) | undefined;
+  private readonly defaultProvider: string;
   private constructor(
     private readonly journal: FileAgentJournal,
-    private readonly runtime: FakeRuntime | NapCatRuntime | SnowLumaRuntime | LLBotRuntime | LLBotRuntime,
+    runtime: AgentRuntime | undefined,
     private readonly transport: AgentCommandTransport,
-  ) {}
+    runtimeFactory?: (provider: string) => Promise<AgentRuntime | null>,
+    defaultProvider?: string,
+  ) {
+    this.defaultProvider = defaultProvider ?? (runtime instanceof NapCatRuntime ? "napcat" : runtime instanceof SnowLumaRuntime ? "snowluma" : runtime instanceof LLBotRuntime ? "llbot" : "fake");
+    if (runtime) this.runtimes.set(this.defaultProvider, runtime);
+    else if (!runtimeFactory) this.runtimes.set(this.defaultProvider, new FakeRuntime());
+    this.runtimeFactory = runtimeFactory;
+  }
   static async open(options: {
     journalPath: string;
-    runtime?: FakeRuntime | NapCatRuntime | SnowLumaRuntime | LLBotRuntime | LLBotRuntime;
+    runtime?: AgentRuntime;
+    runtimeFactory?: (provider: string) => Promise<AgentRuntime | null>;
+    defaultProvider?: string;
     transport: AgentCommandTransport;
   }) {
     return new DurableFakeAgent(
       await FileAgentJournal.open(options.journalPath),
-      options.runtime ?? new FakeRuntime(),
+      options.runtime,
       options.transport,
+      options.runtimeFactory,
+      options.defaultProvider,
     );
+  }
+  /** Resolves the runtime handling this command. The control plane tags each command's
+   *  metadata with the endpoint provider; unknown/legacy commands fall back to the node's
+   *  default provider. Provider values are validated against an allowlist before use. */
+  private async runtimeFor(command: RuntimeCommand): Promise<AgentRuntime> {
+    const raw = command.metadata?.provider;
+    const provider = typeof raw === "string" && (knownProviders as readonly string[]).includes(raw) ? raw : this.defaultProvider;
+    const cached = this.runtimes.get(provider);
+    if (cached) return cached;
+    if (!this.runtimeFactory) {
+      const fallback = this.runtimes.get(this.defaultProvider);
+      if (fallback) { this.runtimes.set(provider, fallback); return fallback; }
+      throw new Error(`agent runtime for provider ${provider} is not available`);
+    }
+    const created = await this.runtimeFactory(provider);
+    if (!created) throw new Error(`agent runtime for provider ${provider} is not available`);
+    this.runtimes.set(provider, created);
+    return created;
+  }
+  private async collectObservations(): Promise<NonNullable<Parameters<AgentCommandTransport["heartbeat"]>[0]>> {
+    const active = [...this.runtimes.values()].filter(runtime => runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime || runtime instanceof LLBotRuntime);
+    // Every endpoint must be reported each cycle — no truncation. The heartbeat schema
+    // caps a single request at 200 entries, so callers batch the full list.
+    return (await Promise.all(active.map(async runtime => {
+      try { return await runtime.observations(); } catch { return []; }
+    }))).flat();
   }
   async pollOnce(): Promise<boolean> {
     // Keep command polling responsive without rewriting full telemetry every tick.
@@ -1020,9 +1063,9 @@ export class DurableFakeAgent {
     }
     const command = await this.transport.claim();
     if (!command) {
-      if(observationDue&&(this.runtime instanceof NapCatRuntime||this.runtime instanceof SnowLumaRuntime||this.runtime instanceof LLBotRuntime)){
-        const observations=await this.runtime.observations();
-        await this.transport.heartbeat(observations);
+      if(observationDue&&this.runtimes.size){
+        const observations=await this.collectObservations();
+        for(let index=0;index<observations.length;index+=200)await this.transport.heartbeat(observations.slice(index,index+200));
       }
       return false;
     }
@@ -1076,12 +1119,13 @@ export class DurableFakeAgent {
     let result = this.journal.get(command.commandId)?.result;
     try {
       if (!result) {
+        const runtime = await this.runtimeFor(command);
         const effectId=`runtime:${command.commandId}`;
         let applied = this.journal.get(command.commandId)?.effects[effectId] as Awaited<ReturnType<NapCatRuntime["apply"] | SnowLumaRuntime["apply"] | LLBotRuntime["apply"]>> | undefined;
         if (!applied)
-          applied = this.runtime instanceof NapCatRuntime || this.runtime instanceof SnowLumaRuntime || this.runtime instanceof LLBotRuntime || this.runtime instanceof LLBotRuntime
-            ? await this.runtime.apply(effectId,command,report,commandAbort.signal)
-            : await this.runtime.apply(effectId,command,report);
+          applied = runtime instanceof NapCatRuntime || runtime instanceof SnowLumaRuntime || runtime instanceof LLBotRuntime
+            ? await runtime.apply(effectId,command,report,commandAbort.signal)
+            : await runtime.apply(effectId,command,report);
         if(fenceError)throw fenceError;
         if (applied) await this.journal.recordEffect(command.commandId, effectId, applied);
         if(fenceError)throw fenceError;
@@ -1152,7 +1196,6 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
   if (!controlPlaneUrl || !nodeStateDir)
     throw new Error("CONTROL_PLANE_URL and NODE_STATE_DIR are required");
   const provider = process.env.AGENT_PROVIDER ?? "fake";
-  const backend = resolveRuntimeBackend(process.env.AGENT_RUNTIME);
   if (!["fake", "napcat", "snowluma", "llbot"].includes(provider)) throw new Error("AGENT_PROVIDER must be fake, napcat, snowluma or llbot");
   const store = new NodeCredentialStore(nodeStateDir);
   let credential = await store.read();
@@ -1162,34 +1205,57 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
     credential = await enroll(controlPlaneUrl, token,provider,signal);
     await store.write(credential);
   }
+  // One node can now host endpoints of any provider: build a lazily-cached runtime per
+  // provider on demand. AGENT_PROVIDER keeps its legacy meaning — it is the provider used
+  // for enrollment and the runtime prewarmed at startup (so heartbeat observations begin
+  // immediately, matching the previous single-runtime behavior).
+  const backend = resolveRuntimeBackend(process.env.AGENT_RUNTIME);
+  const runtimeFactory = async (target: string): Promise<AgentRuntime | null> => {
+    if (target === "napcat") return new NapCatRuntime({
+      stateDirectory: join(nodeStateDir, "napcat"),
+      ...(backend === "kubernetes" ? { driver: new KubernetesRuntimeDriver({ namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(), volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi", ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}) }, signal) } : {}),
+      hostStateDirectory: join(process.env.NAPCAT_HOST_STATE_DIR ?? nodeStateDir, "napcat"),
+      ...(signal === undefined ? {} : { signal }),
+      ...(process.env.NAPCAT_TOKEN === undefined ? {} : { napcatToken: process.env.NAPCAT_TOKEN }),
+    });
+    if (target === "snowluma") {
+      // SnowLuma drives containers through the Docker API surface (exec, published
+      // ports, host bind mounts); there is no Kubernetes-backed DockerClient yet.
+      if (backend === "kubernetes") throw new Error("SnowLuma runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      return new SnowLumaRuntime({
+        docker: new DockerCliClient(),
+        stateDirectory: join(nodeStateDir, "snowluma"),
+        hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
+        ...(signal === undefined ? {} : { signal }),
+        ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
+      });
+    }
+    if (target === "llbot") {
+      if (backend === "kubernetes") throw new Error("LLBot runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      return new LLBotRuntime({
+        docker: new DockerCliClient(),
+        stateDirectory: join(nodeStateDir, "llbot"),
+        hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
+        ...(signal === undefined ? {} : { signal }),
+        ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
+        ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
+      });
+    }
+    if (target === "fake") return FakeRuntime.open(join(nodeStateDir,"runtime-effects.json"));
+    return null;
+  };
+  let primary: AgentRuntime | undefined;
+  try { primary = await runtimeFactory(provider) ?? undefined; }
+  catch (error) {
+    // A misconfigured primary runtime must not prevent the agent from starting; commands
+    // for that provider fail with an explicit error while other providers keep working.
+    console.error(`primary runtime "${provider}" is unavailable, commands for it will fail until the configuration is fixed`, error);
+  }
   return DurableFakeAgent.open({
     journalPath: join(nodeStateDir, "agent-journal.jsonl"),
-    runtime: provider === "napcat"
-      ? new NapCatRuntime({
-          stateDirectory: join(nodeStateDir, "napcat"),
-          ...(backend === "kubernetes" ? { driver: new KubernetesRuntimeDriver({ namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(), volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi", ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}) }, signal) } : {}),
-          hostStateDirectory: join(process.env.NAPCAT_HOST_STATE_DIR ?? nodeStateDir, "napcat"),
-          ...(signal === undefined ? {} : { signal }),
-          ...(process.env.NAPCAT_TOKEN === undefined ? {} : { napcatToken: process.env.NAPCAT_TOKEN }),
-        })
-      : provider === "snowluma"
-      ? new SnowLumaRuntime({
-          docker: new DockerCliClient(),
-          stateDirectory: join(nodeStateDir, "snowluma"),
-          hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
-          ...(signal === undefined ? {} : { signal }),
-          ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
-        })
-      : provider === "llbot"
-      ? new LLBotRuntime({
-          docker: new DockerCliClient(),
-          stateDirectory: join(nodeStateDir, "llbot"),
-          hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
-          ...(signal === undefined ? {} : { signal }),
-          ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
-          ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
-        })
-      : await FakeRuntime.open(join(nodeStateDir,"runtime-effects.json")),
+    ...(primary ? { runtime: primary } : {}),
+    runtimeFactory,
+    defaultProvider: provider,
     transport: new HttpAgentTransport(controlPlaneUrl, credential.nodeSecret,signal?{signal}:{}),
   });
 }

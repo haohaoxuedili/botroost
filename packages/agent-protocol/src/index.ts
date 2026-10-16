@@ -54,6 +54,9 @@ export const AgentHeartbeatRequestSchema = z.strictObject({
 });
 export const ClaimCommandRequestSchema = z.strictObject({
   limit: z.number().int().min(1).max(1).default(1),
+  /** New agents advertise command-level provider routing so the control plane can
+   *  safely dispatch cross-provider endpoints; legacy agents omit this field. */
+  providerRouting: z.boolean().optional(),
 });
 export const RuntimeCommandSchema = z.strictObject({
   commandId: id,

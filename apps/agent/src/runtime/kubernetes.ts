@@ -21,9 +21,17 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     this.core = kc.makeApiClient(CoreV1Api);
     this.metricsApi = new Metrics(kc);
   }
+  /** The kind alone does not determine the group: a NetworkPolicy lives in networking.k8s.io,
+   *  and guessing 'v1' made every read and delete of one fail with "Unrecognized API version". */
+  private static readonly apiVersions: Record<string, string> = {
+    StatefulSet: 'apps/v1', Service: 'v1', Pod: 'v1', PersistentVolumeClaim: 'v1',
+    NetworkPolicy: 'networking.k8s.io/v1', Secret: 'v1', ConfigMap: 'v1',
+  };
   private ref(kind: string, name: string) {
     if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) || name.length > 63) throw new Error('Invalid runtime name');
-    return { apiVersion: kind === 'StatefulSet' ? 'apps/v1' : 'v1', kind, metadata: { name, namespace: this.profile.namespace } };
+    const apiVersion = KubernetesRuntimeDriver.apiVersions[kind];
+    if (!apiVersion) throw new Error(`Unsupported runtime kind ${kind}`);
+    return { apiVersion, kind, metadata: { name, namespace: this.profile.namespace } };
   }
   private async read(kind: string, name: string): Promise<ObjectState | null> {
     this.signal?.throwIfAborted();

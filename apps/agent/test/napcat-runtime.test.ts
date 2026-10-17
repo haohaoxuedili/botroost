@@ -1,4 +1,5 @@
 import { access, mkdtemp, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -519,6 +520,27 @@ describe("NapCat runtime", () => {
     const onebot = snapshot.metadata.onebot as { directory: { friends: { items: unknown[] } } };
     expect(onebot.directory.friends.items).toHaveLength(500);
   });
+
+  it("hashes the token exactly as the container received it", async () => {
+    // NapCat writes the token verbatim into webui.json, newline included, and hashes that on
+    // login. Trimming it here is what made production answer "token is invalid".
+    const labels = { "botroost.workspace_id": baseCommand.workspaceId, "botroost.endpoint_id": baseCommand.endpointId, "botroost.provider": "napcat" };
+    const driver = {
+      backend: "kubernetes" as const,
+      inspect: vi.fn(async () => ({ id: "pod", name: "runtime", image: NAPCAT_IMAGE, state: "running" as const, ipAddress: "runtime.pool.svc", labels })),
+      ensure: vi.fn(), start: vi.fn(), stop: vi.fn(), restart: vi.fn(), forceRestart: vi.fn(), delete: vi.fn(), logs: vi.fn(async () => ""),
+    };
+    const hashes: string[] = [];
+    const fetcher: FetchLike = async (url, init) => {
+      if (new URL(String(url)).pathname === "/api/auth/login") hashes.push(JSON.parse(String(init?.body ?? "{}")).hash);
+      return new Response(JSON.stringify({ code: 0, data: { Credential: "test-credential" } }));
+    };
+    const runtime = new NapCatRuntime({ driver, docker: new RecordingDocker(), stateDirectory: await mkdtemp(join(tmpdir(), "botroost-napcat-token-")), napcatToken: "operator-token\n", fetcher });
+    await runtime.snapshot({ ...baseCommand, metadata: {} }).catch(() => undefined);
+    const hash = (token: string) => createHash("sha256").update(`${token}.napcat`).digest("hex");
+    expect(hashes[0]).toBe(hash("operator-token\n"));
+    expect(hashes[0]).not.toBe(hash("operator-token"));
+  }, 5000);
 
   it("keeps protocol health and successful QQ resources when one directory action fails", async () => {
     const docker = new RecordingDocker();

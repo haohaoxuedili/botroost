@@ -49,6 +49,27 @@ describe('Kubernetes API lifecycle safety', () => {
       expect(patch.mock.calls.length).toBeGreaterThanOrEqual(3);
     } finally { read.mockRestore(); patch.mockRestore(); }
   }, 5000);
+  it('addresses a NetworkPolicy in its own API group', async () => {
+    // A NetworkPolicy read or deleted as "v1" fails with "Unrecognized API version and kind",
+    // which is what broke snowluma start and delete in production.
+    const { config, workload } = fixture();
+    const seen: string[] = [];
+    let policyGone = false;
+    let workloadGone = false;
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockImplementation((async (object: { apiVersion?: string; kind?: string; metadata?: { name?: string } }) => {
+      seen.push(`${object.apiVersion}/${object.kind}`);
+      if (object.kind === 'StatefulSet') return workloadGone ? null : workload;
+      if (object.kind === 'NetworkPolicy' && !policyGone) return { apiVersion: 'networking.k8s.io/v1', kind: 'NetworkPolicy', metadata: { name: object.metadata!.name, uid: 'policy-uid', resourceVersion: '1', labels: workload.metadata.labels } };
+      return null;
+    }) as never);
+    const patch = vi.spyOn(KubernetesObjectApi.prototype, 'patch').mockResolvedValue(workload);
+    const remove = vi.spyOn(KubernetesObjectApi.prototype, 'delete').mockImplementation(async object => { if (object?.kind === 'NetworkPolicy') policyGone = true; if (object?.kind === 'StatefulSet') workloadGone = true; return {}; });
+    try {
+      await new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi', agentNamespace: 'botroost-system' }, undefined, config).delete('test');
+      expect(remove.mock.calls.some(call => call[0]?.kind === 'NetworkPolicy' && call[0]?.apiVersion === 'networking.k8s.io/v1')).toBe(true);
+      expect(seen).not.toContain('v1/NetworkPolicy');
+    } finally { read.mockRestore(); patch.mockRestore(); remove.mockRestore(); }
+  }, 5000);
   it('restores the previous resource request when the larger replacement cannot be scheduled', async () => {
     const { config, labels } = fixture();
     const small = { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '1', memory: '1Gi' } };

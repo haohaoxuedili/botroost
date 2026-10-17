@@ -30,17 +30,46 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     try { return await this.objects.read(this.ref(kind, name)) as ObjectState; }
     catch (error) { if ((error as {code?:number}).code === 404) return null; throw error; }
   }
+  /** Every writer of a runtime object -- the control loop, the kubelet and our own ensure() --
+   *  bumps its resourceVersion, so a patch carrying a version read a moment earlier loses the
+   *  race with a 409. That conflict is normal, not a failure: re-read and apply again. */
+  private static conflicted(error: unknown) {
+    const status = error as { code?: number; statusCode?: number; body?: { code?: number } };
+    return status.code === 409 || status.statusCode === 409 || status.body?.code === 409;
+  }
+  private async retryConflict<T>(write: () => Promise<T>): Promise<T> {
+    let last: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try { return await write(); }
+      catch (error) {
+        if (!KubernetesRuntimeDriver.conflicted(error)) throw error;
+        last = error;
+        await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
+      }
+    }
+    throw last;
+  }
+  private async patch(object: ObjectState) {
+    return this.retryConflict(async () => {
+      const current = await this.read(object.kind!, object.metadata!.name!);
+      if (!current) throw new Error('Runtime resource disappeared before it could be updated');
+      return this.objects.patch({ ...object, metadata: { ...object.metadata, resourceVersion: current.metadata!.resourceVersion! } }, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    });
+  }
   private owned(object: ObjectState, labels: Record<string,string>) {
     for (const key of ['botroost.endpoint_id', 'botroost.workspace_id', 'botroost.provider']) if (!labels[key] || object.metadata?.labels?.[key] !== labels[key]) throw new Error('Runtime resource ownership mismatch');
   }
   private async put(object: ObjectState) {
     this.signal?.throwIfAborted();
-    const old = await this.read(object.kind!, object.metadata!.name!);
-    if (!old) return this.objects.create(object);
-    this.owned(old, object.metadata!.labels!);
-    if (object.kind === 'PersistentVolumeClaim') return old;
-    if (object.kind === 'StatefulSet') object.spec.replicas = old.spec.replicas;
-    return this.objects.patch({ ...object, metadata: { ...object.metadata, resourceVersion: old.metadata!.resourceVersion! } }, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    // A create that loses a race to the control loop's own create surfaces as a 409 too.
+    return this.retryConflict(async () => {
+      const old = await this.read(object.kind!, object.metadata!.name!);
+      if (!old) return this.objects.create(object);
+      this.owned(old, object.metadata!.labels!);
+      if (object.kind === 'PersistentVolumeClaim') return old;
+      if (object.kind === 'StatefulSet') object.spec.replicas = old.spec.replicas;
+      return this.patch(object);
+    });
   }
   async ensure(spec: RuntimeSpec) {
     const resources = kubernetesResources(spec, this.profile);
@@ -113,13 +142,20 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     const old = await this.read('StatefulSet', name);
     if (!old) throw new Error('Runtime not found');
     this.signal?.throwIfAborted();
-    await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: { ...old.metadata }, spec: { replicas } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    await this.patch({ ...this.ref('StatefulSet', name), metadata: { ...old.metadata }, spec: { replicas } } as ObjectState);
   }
   async start(name: string) { await this.scale(name, 1); await this.wait(async () => (await this.inspect(name))?.state === 'running'); }
   async stop(name: string) { await this.scale(name, 0); await this.wait(async () => !(await this.read('Pod', `${name}-0`))); }
   private async remove(object: ObjectState) {
     this.signal?.throwIfAborted();
-    await this.objects.delete(object, undefined, undefined, undefined, undefined, 'Foreground', { preconditions: { uid: object.metadata!.uid!, resourceVersion: object.metadata!.resourceVersion! } });
+    // The uid precondition is what keeps a replacement pod from being deleted by a stale call;
+    // the resourceVersion one only added conflicts, since a running pod's version moves with
+    // every status update.
+    await this.retryConflict(async () => {
+      const current = await this.read(object.kind!, object.metadata!.name!);
+      if (!current || current.metadata?.uid !== object.metadata!.uid) return;
+      await this.objects.delete(current, undefined, undefined, undefined, undefined, 'Foreground', { preconditions: { uid: current.metadata!.uid! } });
+    });
     await this.wait(async () => {
       const current = await this.read(object.kind!, object.metadata!.name!);
       return !current || current.metadata?.uid !== object.metadata!.uid;
@@ -133,7 +169,7 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     const pod = await this.read('Pod', `${name}-0`) as ObjectState | null;
     const marker = 'botroost.io/restart-operation';
     const previousMarker = (workload as { spec?: { template?: { metadata?: { annotations?: Record<string,string> } } } }).spec?.template?.metadata?.annotations?.[marker];
-    await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: workload.metadata, spec: { template: { metadata: { annotations: { [marker]: operation } } } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    await this.patch({ ...this.ref('StatefulSet', name), metadata: workload.metadata, spec: { template: { metadata: { annotations: { [marker]: operation } } } } } as ObjectState);
     if (!pod || pod.metadata?.annotations?.[marker] === operation) return this.start(name);
     this.owned(pod, workload.metadata!.labels!);
     // The pod still runs the request it was created with -- a pod's resources are immutable --
@@ -172,12 +208,12 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     if (!current) return false;
     const template = (current as { spec?: { template?: { spec?: { initContainers?: { name: string }[]; containers?: { name: string }[] } } } }).spec?.template;
     const sized = (containers: { name: string }[] | undefined) => (containers ?? []).map(container => previous[container.name] === undefined ? container : { ...container, resources: previous[container.name] });
-    await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: current.metadata, spec: { template: {
+    await this.patch({ ...this.ref('StatefulSet', name), metadata: current.metadata, spec: { template: {
       // Restoring the marker as well lets a retry of the same operation run again instead of
       // being mistaken for a completed rollout.
       metadata: { annotations: { [marker]: previousMarker ?? null } },
       spec: { initContainers: sized(template?.spec?.initContainers), containers: sized(template?.spec?.containers) },
-    } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    } } } as ObjectState);
     // The pending replacement was built from the larger request, so it has to go for the
     // controller to create one that fits.
     const stuck = await this.read('Pod', `${name}-0`);

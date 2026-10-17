@@ -4,7 +4,7 @@ import { randomBytes } from "node:crypto";
 import { z, ZodError } from "zod";
 import { AuthService, can, requireSameOriginAndCsrf } from "@botroost/auth";
 import { DatabaseError, digest, PostgresDatabase } from "@botroost/database";
-import { registerRuntimeProxy, SAME_ORIGIN_HEADER } from "./runtime-proxy.js";
+import { registerRuntimeProxy, runtimeDialHost } from "./runtime-proxy.js";
 import { AgentEnrollmentRequestSchema, AgentHeartbeatRequestSchema, ClaimCommandRequestSchema, CommandProgressRequestSchema, CommandReceiptRequestSchema, CommandResultRequestSchema, proxyConfigurationSchema } from "@botroost/agent-protocol";
 import { LoginAttemptLimiter } from "./security-policy.js";
 
@@ -37,6 +37,30 @@ const providers = [
 ] as const;
 
 type Permission = "read" | "operate" | "manage-members" | "manage-nodes";
+
+/** The console's own mount for a runtime's UI. Only a *resolved path* may match this: a
+ *  mutating API request must not earn the proxy's CSRF exemption through its query string. */
+const RUNTIME_MOUNT = /^\/api\/v1\/endpoints\/[^/]+\/runtime\/\d+(?:\/|$)/;
+
+/** What the agent observed about an endpoint's runtime UI, as stored in its snapshot. */
+interface RuntimeLoginGuide {
+  /** Ports the operator's browser uses. */
+  webuiPort?: number;
+  novncPort?: number;
+  /** Ports the console must dial: a Service routes the container's port, not the host port. */
+  webuiDialPort?: number;
+  novncDialPort?: number;
+  /** Cluster-internal address of the runtime's Service. */
+  webuiHost?: string;
+  /** Operator-supplied entry point (RUNTIME_LOGIN_BASE_URL), for split deployments. */
+  webuiUrl?: string;
+  novncUrl?: string;
+}
+
+/** A port the agent reported, or null: never a value the caller supplied. */
+function reportedPort(value: number | undefined) {
+  return Number.isInteger(value) && value! > 0 && value! <= 65535 ? value : null;
+}
 export interface ApiOptions { database?: PostgresDatabase; databaseUrl?: string; credentialKey?: Buffer; trustProxy?: FastifyServerOptions["trustProxy"]; publicOrigin?: string }
 const page=<T>(items:T[])=>({items,page:1,pageSize:25,total:items.length});
 const rolePermissions:Record<string,string[]>={viewer:["endpoint:read","node:read","provider:read","operation:read","audit:read","workspace:read"],operator:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","provider:read","operation:read","audit:read","workspace:read"],admin:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","node:create","node:delete","provider:read","operation:read","audit:read","workspace:read","member:read","member:manage","settings:read","settings:manage"],owner:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","node:create","node:delete","provider:read","operation:read","audit:read","workspace:read","member:read","member:manage","settings:read","settings:manage"]};
@@ -94,8 +118,11 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
     // The runtime proxy forwards to an endpoint's own UI, not to this API: it carries its own
     // same-origin guard (a custom header on mutating methods) and must not require this API's
     // CSRF token, which the proxied page never has.
-    if (request.url.includes("/runtime/")) return;
-    if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(request.url) || request.url.startsWith("/api/v1/agent/")) return;
+    // Only the resolved path may grant the exemption: a mutating API request whose query
+    // string happens to contain "/runtime/" must still face the origin and CSRF checks.
+    const path = request.url.split("?")[0] ?? request.url;
+    if (RUNTIME_MOUNT.test(path)) return;
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(path) || path.startsWith("/api/v1/agent/")) return;
     const current = await principal(request);
     try {
       requireSameOriginAndCsrf({ method: request.method, host:origin.host, ...(request.headers.origin ? { origin: request.headers.origin } : {}), ...(request.cookies.botroost_csrf ? { csrfCookie: request.cookies.botroost_csrf } : {}), ...(request.headers["x-csrf-token"] ? { csrfHeader: String(request.headers["x-csrf-token"]) } : {}), expectedCsrfHash: current.csrfHash });
@@ -105,8 +132,9 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
   // Runtime UI through the console: see registerRuntimeProxy. Registered before the API
   // routes so its wildcard prefix owns /runtime/... and never collides with them.
   registerRuntimeProxy(api, {
-    async authorize(request, endpointId, _port) {
-      const current = await principal(request);
+    async authorize(request, endpointId) {
+      // Operating a runtime UI is an operation, not a read: a viewer must not reach noVNC.
+      const current = await authorize(request, "operate");
       // An endpoint outside the caller's workspace must look non-existent, not forbidden.
       const endpoint = await db.endpoint(current.workspaceId, endpointId);
       if (!endpoint) throw new DatabaseError("not_found");
@@ -115,20 +143,36 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
     async route(workspaceId, endpointId, port) {
       const endpoint = await db.endpoint(workspaceId, endpointId);
       if (!endpoint) return null;
-      const provider = endpoint.providerId === "snowluma" ? "snowluma" : endpoint.providerId === "llbot" ? "llbot" : null;
-      if (!provider) return null;
-      // The address comes from the endpoint's own latest observation, never from the caller.
+      const provider = endpoint.providerId;
+      if (provider !== "snowluma" && provider !== "llbot") return null;
+      // A snapshot failure is the console's problem, not the runtime's: let it propagate so
+      // the proxy answers "unavailable" instead of "runtime unreachable".
       const snapshot = provider === "snowluma"
-        ? await db.endpointSnowlumaSnapshot(workspaceId, endpointId).catch(() => null)
-        : await db.endpointLLBotSnapshot(workspaceId, endpointId).catch(() => null);
-      const metadata = snapshot?.metadata as { loginGuide?: { webuiHost?: string; webuiPort?: number; novncPort?: number } } | null;
-      const guide = metadata?.loginGuide;
-      const host = guide?.webuiHost;
-      if (!host) return null;
-      // Only the ports the agent published for this endpoint: the caller cannot pick a target.
-      const allowed = [guide.webuiPort, guide.novncPort].filter((value): value is number => typeof value === "number");
-      if (allowed.length && !allowed.includes(port)) return null;
-      return { host: `${host}:${port}`, token: null };
+        ? await db.endpointSnowlumaSnapshot(workspaceId, endpointId)
+        : await db.endpointLLBotSnapshot(workspaceId, endpointId);
+      const guide = (snapshot?.metadata as { loginGuide?: RuntimeLoginGuide } | null)?.loginGuide;
+      if (!guide) return null;
+      // The console asks with a published port; only the ones the agent reported are answered,
+      // and each maps to the port the console must actually dial (a Service routes the
+      // container's port, Docker publishes the host port) and to the operator's entry URL.
+      const candidates = [
+        { published: guide.webuiPort, dial: guide.webuiDialPort, url: guide.webuiUrl },
+        { published: guide.novncPort, dial: guide.novncDialPort, url: guide.novncUrl },
+      ].filter(candidate => candidate.published === port);
+      const match = candidates[0];
+      if (!match) return null;
+      // An operator-provided entry point is the only address that survives a split deployment,
+      // where the API cannot route to the cluster's Service network.
+      const entry = match.url ? new URL(match.url) : null;
+      if (entry && entry.protocol === "https:" && entry.hostname) {
+        return { host: entry.hostname, port: Number(entry.port || 443), scheme: "https" as const, query: entry.search || null };
+      }
+      // Otherwise dial the address the agent reported, which must be a cluster-local one: the
+      // agent's heartbeat is not a licence to point the console at an arbitrary destination.
+      const host = runtimeDialHost(guide.webuiHost);
+      const dial = reportedPort(match.dial) ?? reportedPort(match.published);
+      if (!host || !dial) return null;
+      return { host, port: dial };
     },
   });
   api.get("/health", async () => ({ status: "ok" }));

@@ -1,7 +1,7 @@
 // SnowLuma runtime: an independent OneBot v11 provider runtime.
 // Deliberately does not import runtime values from ./index.js so it stays
 // fully isolated from the NapCat code paths (type-only imports are erased).
-import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { join, resolve, sep } from "node:path";
 import {
@@ -12,7 +12,7 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseSnowlumaConnectionLine, parseSnowlumaTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
-import { loginUrl, runtimeHost } from "./runtime/login-links.js";
+import { loginUrl, runtimeDialPort, runtimeHost } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -603,7 +603,13 @@ export class SnowLumaRuntime {
     // Kubernetes cannot publish host ports, so the browser needs the cluster entry point; when
     // none is configured the ports are still reported for an operator with port-forward access.
     const webuiHost = runtimeHost(inspected.serviceHost);
-    const loginGuide = { novncPort: ports.novncPort, webuiPort: ports.webuiPort, ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}), ...(novncUrl ? { novncUrl } : {}), ...webui };
+    const loginGuide = {
+      novncPort: ports.novncPort, webuiPort: ports.webuiPort,
+      // Docker publishes these host ports; a Kubernetes Service routes the container's own.
+      novncDialPort: runtimeDialPort(ports.novncPort, NOVNC_CONTAINER_PORT, inspected.serviceHost),
+      webuiDialPort: runtimeDialPort(ports.webuiPort, WEBUI_CONTAINER_PORT, inspected.serviceHost),
+      ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}), ...(novncUrl ? { novncUrl } : {}), ...webui,
+    };
     if (statusSettled.status === "rejected") {
       // SnowLuma only starts its OneBot HTTP server (container port 3000) after QQ
       // logs in, so an unreachable provider while the container is running means

@@ -27,11 +27,11 @@ afterEach(async () => {
   for (const server of servers.splice(0)) await new Promise<void>(resolve => server.close(() => resolve()));
 });
 
-async function build(runtimePort: number, overrides: Partial<{ authorize: () => Promise<{ workspaceId: string }>; route: () => Promise<{ host: string } | null> }> = {}) {
+async function build(runtimePort: number, overrides: Partial<{ authorize: () => Promise<{ workspaceId: string }>; route: () => Promise<{ host: string; port: number } | null> }> = {}) {
   const app = Fastify();
   registerRuntimeProxy(app, {
     authorize: overrides.authorize ?? (async () => ({ workspaceId: "w1" })),
-    route: overrides.route ?? (async () => ({ host: `127.0.0.1:${runtimePort}` })),
+    route: overrides.route ?? (async () => ({ host: "127.0.0.1", port: runtimePort })),
   });
   await app.listen({ port: 0, host: "127.0.0.1" });
   apps.push(app);

@@ -29,3 +29,15 @@ export function runtimeHost(serviceHost: string | null | undefined): string | un
   const value = serviceHost?.trim();
   return value ? value : undefined;
 }
+
+/** Port the *console's API* should dial for a runtime UI port.
+ *
+ *  The number a browser uses and the number the console dials are not the same on Kubernetes:
+ *  Docker publishes `<hostPort>` on the agent host, while a Service routes the container's own
+ *  port. Reporting both lets the console validate the operator's link and still dial correctly.
+ */
+export function runtimeDialPort(publishedPort: number, containerPort: string | number, serviceHost?: string | null): number {
+  const container = Number(containerPort);
+  // Without a Service there is nothing to route through: the published port is the listener.
+  return serviceHost?.trim() && Number.isInteger(container) && container > 0 ? container : publishedPort;
+}

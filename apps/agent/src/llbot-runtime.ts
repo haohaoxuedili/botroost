@@ -1,7 +1,7 @@
 // LLBot runtime: an independent OneBot v11 provider runtime backed by LLBot.
 // Deliberately does not import runtime values from ./index.js so it stays
 // fully isolated from the NapCat/SnowLuma code paths (type-only imports are erased).
-import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import {
   RuntimeCommandSchema,
@@ -11,7 +11,7 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseLLBotConnectionLine, parseLLBotTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
-import { loginUrl, runtimeHost } from "./runtime/login-links.js";
+import { loginUrl, runtimeDialPort, runtimeHost } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -444,7 +444,12 @@ export class LLBotRuntime {
     const webuiUrl = loginUrl(ports.webuiPort);
     // See loginUrl(): on Kubernetes the browser needs an operator-provided entry point.
     const webuiHost = runtimeHost(inspected.serviceHost);
-    const loginGuide = { webuiPort: ports.webuiPort, ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}) };
+    const loginGuide = {
+      webuiPort: ports.webuiPort,
+      // Docker publishes webuiPort; a Kubernetes Service routes the container's own port.
+      webuiDialPort: runtimeDialPort(ports.webuiPort, WEBUI_CONTAINER_PORT, inspected.serviceHost),
+      ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}),
+    };
     const [statusSettled, loginSettled, versionSettled] = await Promise.allSettled([
       this.oneBotGet(base, "get_status", token),
       this.oneBotGet(base, "get_login_info", token),

@@ -128,8 +128,6 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     // Durable template marker makes replay after pod deletion idempotent.
     // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
     const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
-    const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
-    const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     const marker = 'botroost.io/restart-operation';
     await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: workload.metadata, spec: { template: { metadata: { annotations: { [marker]: operation } } } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
     if (pod && pod.metadata?.annotations?.[marker] !== operation) { this.owned(pod, workload.metadata!.labels!); await this.remove(pod); }
@@ -159,8 +157,6 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   async logs(name: string, options: { tail: number; sinceSeconds: number; timestamps?: boolean; maxBytes?: number }) {
     // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
     const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
-    const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
-    const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     // A stopped endpoint has been scaled to zero, which removes the pod and with it the pod
     // log. Report that instead of failing the operator's diagnostic request.
     if (!pod || pod.metadata?.deletionTimestamp) return '';

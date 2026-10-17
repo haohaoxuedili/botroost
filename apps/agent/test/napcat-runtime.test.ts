@@ -416,6 +416,22 @@ describe("NapCat runtime", () => {
     const deleting = { ...baseCommand, commandId: "cmd-delete", operationId: "op-delete", generation: 2, action: "delete" } as unknown as RuntimeCommand;
     await runtime.apply("runtime:delete", deleting);
     expect(order).toEqual(["workload", "data"]);
+    // The identity comes from the command, and the endpoint's caches go with it.
+    expect(driver.deleteData).toHaveBeenCalledWith("botroost-napcat-" + baseCommand.endpointId, { endpointId: baseCommand.endpointId, workspaceId: baseCommand.workspaceId, provider: "napcat" }, expect.anything());
+  }, 5000);
+
+  it("refuses to report a deletion the driver cannot complete", async () => {
+    // An optional deleteData that is missing used to make deletion a silent no-op that kept
+    // the endpoint's volume; the command now fails instead.
+    const labels = { "botroost.workspace_id": baseCommand.workspaceId, "botroost.endpoint_id": baseCommand.endpointId, "botroost.provider": "napcat" };
+    const driver = {
+      backend: "kubernetes" as const,
+      inspect: vi.fn(async () => ({ id: "pod", name: "runtime", image: NAPCAT_IMAGE, state: "running" as const, ipAddress: "runtime.pool.svc", labels })),
+      ensure: vi.fn(), start: vi.fn(), stop: vi.fn(), restart: vi.fn(), forceRestart: vi.fn(), logs: vi.fn(async () => ""), delete: vi.fn(async () => undefined),
+    };
+    const runtime = new NapCatRuntime({ driver, docker: new RecordingDocker(), stateDirectory: await mkdtemp(join(tmpdir(), "botroost-napcat-noclaim-")), napcatToken: "operator-token" });
+    const deleting = { ...baseCommand, commandId: "cmd-delete", operationId: "op-delete", generation: 2, action: "delete" } as unknown as RuntimeCommand;
+    await expect(runtime.apply("runtime:delete", deleting)).rejects.toThrow(/discard endpoint data/);
   }, 5000);
 
   it("retries host-state cleanup after the protocol container was already removed", async () => {

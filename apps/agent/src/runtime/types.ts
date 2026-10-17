@@ -24,6 +24,10 @@ export interface RuntimeSpec {
   shmBytes?: number;
 }
 /** Infrastructure boundary; protocol HTTP and OneBot remain in the provider. */
+/** Who an endpoint belongs to. Supplied by the command being executed, never read back from
+ *  the objects being deleted: a reused endpoint id must not vouch for another endpoint's data. */
+export interface RuntimeOwner { endpointId?: string; workspaceId?: string; provider?: string }
+
 export interface RuntimeDriver {
   readonly backend: 'docker' | 'kubernetes';
   inspect(name: string): Promise<DockerInspectResult | null>;
@@ -32,10 +36,10 @@ export interface RuntimeDriver {
   stop(name: string): Promise<void>;
   restart(name: string, operationId: string): Promise<void>;
   forceRestart(name: string, operationId: string): Promise<void>;
-  delete(name: string): Promise<void>;
+  delete(name: string, signal?: AbortSignal): Promise<void>;
   /** Drop the workload's durable volume. Only an explicit endpoint deletion calls this;
    *  delete() retains it so a replaced runtime keeps its login state. */
-  deleteData?(name: string): Promise<void>;
+  deleteData?(name: string, owner?: RuntimeOwner, signal?: AbortSignal): Promise<void>;
   logs: DockerClient['logs'];
   stats?: DockerClient['stats'];
   /** Run a command inside the workload's protocol container. Optional: a backend that

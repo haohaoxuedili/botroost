@@ -186,7 +186,7 @@ export class LLBotRuntime {
     if (command.action === "delete") {
       await onProgress({ phase: "removing-runtime", percent: 55, message: "Removing container and persisted runtime data" });
       // Explicit endpoint deletion is the only path allowed to discard durable state.
-      if (existing) await docker.remove(name, { discardData: true });
+      if (existing) await docker.remove(name, { discardData: true, owner: { endpointId: command.endpointId, workspaceId: command.workspaceId, provider: "llbot" } });
       await onProgress({ phase: "removing-runtime", percent: 62, message: "Removing persisted host runtime data" });
       await docker.removeHostEndpoint(resolve(this.options.hostStateDirectory ?? this.options.stateDirectory), command.endpointId, LLBOT_IMAGE);
       await onProgress({ phase: "removing-runtime", percent: 70, message: "Removing agent runtime state" });

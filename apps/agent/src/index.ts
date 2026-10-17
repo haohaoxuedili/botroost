@@ -18,7 +18,7 @@ import { applyProxyEnvironment } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator } from "./traffic.js";
 import { SnowLumaRuntime, SNOWLUMA_IMAGE } from "./snowluma-runtime.js";
 import { LLBotRuntime } from "./llbot-runtime.js";
-import type { RuntimeDriver, RuntimeSpec } from './runtime/types.js';
+import type { RuntimeDriver, RuntimeOwner, RuntimeSpec } from './runtime/types.js';
 import { resolveRuntimeBackend } from './runtime/config.js';
 import { KubernetesRuntimeDriver } from './runtime/kubernetes.js';
 import { KubernetesDockerClient } from './runtime/kubernetes-docker.js';
@@ -127,7 +127,7 @@ export interface DockerClient {
   inspect(name: string): Promise<DockerInspectResult | null>;
   create(input: DockerCreateInput): Promise<{ id: string }>;
   /** `discardData` is only set on explicit endpoint deletion; replacement keeps durable state. */
-  remove(name: string, options?: { discardData?: boolean }): Promise<void>;
+  remove(name: string, options?: { discardData?: boolean; owner?: RuntimeOwner }): Promise<void>;
   removeHostEndpoint(root: string, endpointId: string, image: string): Promise<void>;
   start(name: string): Promise<void>;
   stop(name: string): Promise<void>;
@@ -563,14 +563,25 @@ export class NapCatRuntime {
         resources: napcatResourceLimits(command.runtimeRequest.resources),
       };
       if (command.action === 'delete') {
-        await driver.delete(name);
-        // The workload is gone but its claim is not: explicit deletion is the only path
-        // allowed to discard durable state, so drop it before reporting success.
-        await driver.deleteData?.(name);
+        // A command whose lease was lost must not destroy anything; the claim deletion below
+        // is irreversible, so it is fenced around as well as before.
+        const signal = runtimeIoSignal.getStore();
+        signal?.throwIfAborted();
+        await driver.delete(name, signal);
+        signal?.throwIfAborted();
+        if (!driver.deleteData) throw new Error('Runtime driver cannot discard endpoint data');
+        // Ownership comes from the command, not from the claim: a reused endpoint id must not
+        // be able to delete another endpoint's volume.
+        await driver.deleteData(name, { endpointId: command.endpointId, workspaceId: command.workspaceId, provider: 'napcat' }, signal);
         this.commands.delete(command.endpointId);
         await this.persistCommands();
         this.snapshotCache.delete(command.endpointId);
         this.webCredentials.delete(command.endpointId);
+        // A later endpoint may reuse the id; it must not inherit this account's data.
+        this.directoryCache.delete(command.endpointId);
+        this.trafficAccumulators.delete(command.endpointId);
+        this.trafficCache.delete(command.endpointId);
+        this.trafficLastSuccessAt.delete(command.endpointId);
         return { state: 'stopped', observations: { node: 'online', runtime: 'stopped', provider: 'unavailable', protocol: 'disconnected', convergence: 'converged' }, metadata: { deleted: true } };
       }
       const lifecycle = ['start', 'stop', 'restart', 'force-restart', 'update-endpoint-proxy'].includes(command.action);

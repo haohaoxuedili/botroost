@@ -2,6 +2,7 @@ import { CoreV1Api, Exec, KubeConfig, KubernetesObjectApi, Metrics, type V1Statu
 import { PassThrough } from 'node:stream';
 import type { DockerClient, DockerCreateInput, DockerInspectResult } from '../index.js';
 import type { DockerResourceSample } from '../resource-usage.js';
+import type { RuntimeOwner } from './types.js';
 import type { RuntimeDriver, RuntimeSpec, RuntimeVolume } from './types.js';
 import { type KubernetesProfile } from './kubernetes-resources.js';
 
@@ -139,13 +140,16 @@ export class KubernetesDockerClient implements DockerClient {
   async stop(name: string): Promise<void> { return this.driver.stop(await this.resolveName(name)); }
   async restart(name: string): Promise<void> { return this.driver.restart(await this.resolveName(name), `docker-restart-${Date.now()}`); }
   async kill(name: string): Promise<void> { return this.driver.forceRestart(await this.resolveName(name), `docker-kill-${Date.now()}`); }
-  async remove(name: string, options?: { discardData?: boolean }): Promise<void> {
+  async remove(name: string, options?: { discardData?: boolean; owner?: RuntimeOwner }): Promise<void> {
     const workload = await this.resolveName(name);
     // Replacing a workload for a new image/resources must not cost the user their QQ login,
     // so the claim is only dropped when the endpoint itself is being deleted.
     await this.driver.delete(workload);
-    // Claim last: the pod still mounts it until the workload is gone.
-    if (options?.discardData) await this.driver.deleteData?.(workload).catch(() => {});
+    if (!options?.discardData) return;
+    // Claim last: the pod still mounts it until the workload is gone. A backend that cannot
+    // drop the claim must fail loudly rather than report a deletion that kept its data.
+    if (!this.driver.deleteData) throw new Error('Runtime driver cannot discard endpoint data');
+    await this.driver.deleteData(workload, options.owner);
   }
   // Docker deletes the endpoint's host directory. On Kubernetes the claim is the equivalent
   // durable state and is removed by remove(..., { discardData: true }) above.

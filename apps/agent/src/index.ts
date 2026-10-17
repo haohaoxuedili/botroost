@@ -579,6 +579,7 @@ export class NapCatRuntime {
         await this.persistCommands();
         this.snapshotCache.delete(command.endpointId);
         this.webCredentials.delete(command.endpointId);
+        this.napcatTokenVariants.delete(command.endpointId);
         // A later endpoint may reuse the id; it must not inherit this account's data.
         this.directoryCache.delete(command.endpointId);
         this.trafficAccumulators.delete(command.endpointId);
@@ -621,6 +622,7 @@ export class NapCatRuntime {
       this.snapshotCache.delete(command.endpointId);
       this.directoryCache.delete(command.endpointId);
       this.webCredentials.delete(command.endpointId);
+      this.napcatTokenVariants.delete(command.endpointId);
       this.trafficAccumulators.delete(command.endpointId);
       this.trafficCache.delete(command.endpointId);
       this.trafficLastSuccessAt.delete(command.endpointId);
@@ -778,7 +780,11 @@ export class NapCatRuntime {
     let payload = await response.json() as JsonObject;
     if (typeof payload.code === "number" && payload.code !== 0 && endpointId && String(payload.message ?? "").toLowerCase().includes("unauthorized")) {
       const current = this.webCredentials.get(endpointId);
-      if (current === webToken) this.webCredentials.delete(endpointId);
+      if (current === webToken) {
+        this.webCredentials.delete(endpointId);
+        // A rejected credential may mean the token itself was rotated: forget which form worked.
+        this.napcatTokenVariants.delete(endpointId);
+      }
       response = await request(current && current !== webToken ? current : await this.webCredential(endpointId, base));
       if (!response.ok) throw new Error(`NapCat request failed: ${response.status}`);
       payload = await response.json() as JsonObject;
@@ -805,9 +811,10 @@ export class NapCatRuntime {
     // ask NapCat which one it stored, and remember the answer for this endpoint.
     const loginToken=this.options.napcatToken??process.env.NAPCAT_TOKEN??"";
     const remembered=this.napcatTokenVariants.get(endpointId);
-    const candidates=remembered==="trimmed"?[loginToken.trim()]
-      :remembered==="raw"?[loginToken]
-      :[loginToken,loginToken.trim()].filter((value,index,all)=>all.indexOf(value)===index);
+    const forms=[loginToken,loginToken.trim()].filter((value,index,all)=>all.indexOf(value)===index);
+    // Probe the form this endpoint accepted last time first, but never lock onto it: the token can
+    // be rotated, or an endpoint can be recreated under the same id with the other form.
+    const candidates=remembered==="trimmed"?[...forms].reverse():forms;
     let rejection: Error|undefined;
     for(const candidate of candidates){
       const hashed=createHash("sha256").update(`${candidate}.napcat`).digest("hex");

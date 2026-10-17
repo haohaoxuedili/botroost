@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { z, ZodError } from "zod";
 import { AuthService, can, requireSameOriginAndCsrf } from "@botroost/auth";
 import { DatabaseError, digest, PostgresDatabase } from "@botroost/database";
+import { registerRuntimeProxy, SAME_ORIGIN_HEADER } from "./runtime-proxy.js";
 import { AgentEnrollmentRequestSchema, AgentHeartbeatRequestSchema, ClaimCommandRequestSchema, CommandProgressRequestSchema, CommandReceiptRequestSchema, CommandResultRequestSchema, proxyConfigurationSchema } from "@botroost/agent-protocol";
 import { LoginAttemptLimiter } from "./security-policy.js";
 
@@ -89,13 +90,47 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
     return result;
   }
   api.addHook("preHandler", async request => {
-    const publicRoutes=["/api/v1/auth/login","/api/v1/auth/register","/api/v1/auth/invitations/accept"];if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(request.url) || request.url.startsWith("/api/v1/agent/")) return;
+    const publicRoutes=["/api/v1/auth/login","/api/v1/auth/register","/api/v1/auth/invitations/accept"];
+    // The runtime proxy forwards to an endpoint's own UI, not to this API: it carries its own
+    // same-origin guard (a custom header on mutating methods) and must not require this API's
+    // CSRF token, which the proxied page never has.
+    if (request.url.includes("/runtime/")) return;
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(request.url) || request.url.startsWith("/api/v1/agent/")) return;
     const current = await principal(request);
     try {
       requireSameOriginAndCsrf({ method: request.method, host:origin.host, ...(request.headers.origin ? { origin: request.headers.origin } : {}), ...(request.cookies.botroost_csrf ? { csrfCookie: request.cookies.botroost_csrf } : {}), ...(request.headers["x-csrf-token"] ? { csrfHeader: String(request.headers["x-csrf-token"]) } : {}), expectedCsrfHash: current.csrfHash });
     } catch { throw fail("csrf rejected", 403); }
   });
 
+  // Runtime UI through the console: see registerRuntimeProxy. Registered before the API
+  // routes so its wildcard prefix owns /runtime/... and never collides with them.
+  registerRuntimeProxy(api, {
+    async authorize(request, endpointId, _port) {
+      const current = await principal(request);
+      // An endpoint outside the caller's workspace must look non-existent, not forbidden.
+      const endpoint = await db.endpoint(current.workspaceId, endpointId);
+      if (!endpoint) throw new DatabaseError("not_found");
+      return { workspaceId: current.workspaceId };
+    },
+    async route(workspaceId, endpointId, port) {
+      const endpoint = await db.endpoint(workspaceId, endpointId);
+      if (!endpoint) return null;
+      const provider = endpoint.providerId === "snowluma" ? "snowluma" : endpoint.providerId === "llbot" ? "llbot" : null;
+      if (!provider) return null;
+      // The address comes from the endpoint's own latest observation, never from the caller.
+      const snapshot = provider === "snowluma"
+        ? await db.endpointSnowlumaSnapshot(workspaceId, endpointId).catch(() => null)
+        : await db.endpointLLBotSnapshot(workspaceId, endpointId).catch(() => null);
+      const metadata = snapshot?.metadata as { loginGuide?: { webuiHost?: string; webuiPort?: number; novncPort?: number } } | null;
+      const guide = metadata?.loginGuide;
+      const host = guide?.webuiHost;
+      if (!host) return null;
+      // Only the ports the agent published for this endpoint: the caller cannot pick a target.
+      const allowed = [guide.webuiPort, guide.novncPort].filter((value): value is number => typeof value === "number");
+      if (allowed.length && !allowed.includes(port)) return null;
+      return { host: `${host}:${port}`, token: null };
+    },
+  });
   api.get("/health", async () => ({ status: "ok" }));
   api.get("/ready", async (_request, reply) => { try { await db.ping();if(!await db.migrationsReady())throw new Error("schema ledger unavailable"); return { status: "ready" }; } catch { return reply.code(503).send({ error: { code: "not_ready", message: "database or schema unavailable" } }); } });
   api.get("/api/v1/platform/settings",async request=>{const current=await principal(request);if(!await db.isPlatformOwner(current.userId))throw fail("platform owner required",403);return db.platformSettings()});

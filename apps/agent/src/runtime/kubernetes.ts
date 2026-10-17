@@ -49,14 +49,23 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   async inspect(name: string): Promise<DockerInspectResult | null> {
     const workload = await this.read('StatefulSet', name);
     if (!workload) return null;
-    const pod = await this.read('Pod', `${name}-0`);
+    // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
+    const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
+    const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
+    const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     const template = (workload as { spec: { template: { spec: { containers: { image: string; resources?: { limits?: Record<string, string>; requests?: Record<string, string> }; envFrom?: { secretRef?: { name?: string } }[] }[] } } } }).spec.template.spec;
     const container = template.containers[0]!;
     const running = workload.spec.replicas === 1 && !pod?.metadata?.deletionTimestamp && !!pod?.status?.containerStatuses?.some(c => c.name === 'protocol' && c.state?.running);
     const envSecret = container.envFrom?.find(source => source.secretRef?.name)?.secretRef?.name;
     return { id: pod?.metadata?.uid ?? workload.metadata!.uid!, name, image: container.image,
       state: running ? 'running' : workload.spec.replicas === 0 ? 'exited' : 'created',
-      ipAddress: running ? `${name}.${this.profile.namespace}.svc` : null,
+      // The pod IP is what providers dial from the agent: it needs no cluster DNS, which a
+      // cluster without CoreDNS cannot resolve.
+      ipAddress: running ? pod?.status?.podIP ?? null : null,
+      // What the console's API dials. The ClusterIP needs no cluster DNS (a cluster without
+      // CoreDNS cannot resolve Service names), and the Service name is the fallback for a
+      // cluster that reports the address late.
+      serviceHost: running ? clusterIP ?? `${name}.${this.profile.namespace}.svc` : null,
       labels: workload.metadata!.labels ?? {},
       ...this.reportedResources(container.resources?.limits, container.resources?.requests),
       ...await this.reportedProxy(envSecret),
@@ -117,7 +126,10 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     const workload = await this.read('StatefulSet', name);
     if (!workload) throw new Error('Runtime not found');
     // Durable template marker makes replay after pod deletion idempotent.
-    const pod = await this.read('Pod', `${name}-0`);
+    // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
+    const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
+    const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
+    const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     const marker = 'botroost.io/restart-operation';
     await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: workload.metadata, spec: { template: { metadata: { annotations: { [marker]: operation } } } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
     if (pod && pod.metadata?.annotations?.[marker] !== operation) { this.owned(pod, workload.metadata!.labels!); await this.remove(pod); }
@@ -145,7 +157,10 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     await this.remove(claim);
   }
   async logs(name: string, options: { tail: number; sinceSeconds: number; timestamps?: boolean; maxBytes?: number }) {
-    const pod = await this.read('Pod', `${name}-0`);
+    // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
+    const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
+    const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
+    const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     // A stopped endpoint has been scaled to zero, which removes the pod and with it the pod
     // log. Report that instead of failing the operator's diagnostic request.
     if (!pod || pod.metadata?.deletionTimestamp) return '';
@@ -205,4 +220,9 @@ function parseKubernetesQuantity(value: string | undefined): number {
     case 'Ei': return base * 1024 ** 6;
     default: return 0;
   }
+}
+
+/** Kubernetes Service name for a workload: RFC 1123 label, at most 63 characters. */
+export function dnsLabel(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 63).replace(/-+$/g, "");
 }

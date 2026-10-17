@@ -16,3 +16,16 @@ export function loginUrl(port: number): string | undefined {
   const resolved = template.replace(/\{port\}/g, String(port)).replace(/\/+$/, '');
   return resolved ? `${resolved}/` : undefined;
 }
+
+/** Host the *console's API* should use to reach a runtime's UI ports.
+ *
+ *  Docker publishes host ports on the agent host, which is also where the console runs, so the
+ *  backend reports no such host and the console falls back to its own hostname. Kubernetes
+ *  reports the runtime Service's address: a browser cannot dial it, but the API can, so the
+ *  console proxies every request through its own origin and the operator never needs a second
+ *  hostname or a port-forward.
+ */
+export function runtimeHost(serviceHost: string | null | undefined): string | undefined {
+  const value = serviceHost?.trim();
+  return value ? value : undefined;
+}

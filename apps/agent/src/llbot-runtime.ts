@@ -11,7 +11,7 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseLLBotConnectionLine, parseLLBotTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
-import { loginUrl } from "./runtime/login-links.js";
+import { loginUrl, runtimeHost } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -443,7 +443,8 @@ export class LLBotRuntime {
     const ports = llbotLoginPorts(command.endpointId);
     const webuiUrl = loginUrl(ports.webuiPort);
     // See loginUrl(): on Kubernetes the browser needs an operator-provided entry point.
-    const loginGuide = { webuiPort: ports.webuiPort, ...(webuiUrl ? { webuiUrl } : {}) };
+    const webuiHost = runtimeHost(inspected.serviceHost);
+    const loginGuide = { webuiPort: ports.webuiPort, ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}) };
     const [statusSettled, loginSettled, versionSettled] = await Promise.allSettled([
       this.oneBotGet(base, "get_status", token),
       this.oneBotGet(base, "get_login_info", token),

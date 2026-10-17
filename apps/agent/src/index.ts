@@ -113,6 +113,9 @@ export interface DockerInspectResult {
   image: string;
   state: "created" | "running" | "exited" | "unknown";
   ipAddress: string | null;
+  /** Cluster Service name, when the backend has one. Providers report it so the console can
+   *  reach the runtime's UI ports without publishing them. */
+  serviceHost?: string | null;
   labels: Record<string, string>;
   resources?: { cpuMillis: number; memoryMiB: number; memorySwapMiB: number };
   resourceLimits?: ResourceLimits;

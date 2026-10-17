@@ -12,7 +12,7 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseSnowlumaConnectionLine, parseSnowlumaTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
-import { loginUrl } from "./runtime/login-links.js";
+import { loginUrl, runtimeHost } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -602,7 +602,8 @@ export class SnowLumaRuntime {
     const webuiUrl = loginUrl(ports.webuiPort), novncUrl = loginUrl(ports.novncPort);
     // Kubernetes cannot publish host ports, so the browser needs the cluster entry point; when
     // none is configured the ports are still reported for an operator with port-forward access.
-    const loginGuide = { novncPort: ports.novncPort, webuiPort: ports.webuiPort, ...(webuiUrl ? { webuiUrl } : {}), ...(novncUrl ? { novncUrl } : {}), ...webui };
+    const webuiHost = runtimeHost(inspected.serviceHost);
+    const loginGuide = { novncPort: ports.novncPort, webuiPort: ports.webuiPort, ...(webuiHost ? { webuiHost } : {}), ...(webuiUrl ? { webuiUrl } : {}), ...(novncUrl ? { novncUrl } : {}), ...webui };
     if (statusSettled.status === "rejected") {
       // SnowLuma only starts its OneBot HTTP server (container port 3000) after QQ
       // logs in, so an unreachable provider while the container is running means

@@ -17,16 +17,19 @@
     "migrate": "node dist/migrate.js"
   },
   "dependencies": {
-    "fastify": "^5.6.2",
-    "@botroost/database": "workspace:*",
-    "@botroost/auth": "workspace:*",
     "@botroost/agent-protocol": "workspace:*",
+    "@botroost/auth": "workspace:*",
+    "@botroost/database": "workspace:*",
     "@fastify/cookie": "11.0.2",
+    "@fastify/websocket": "^11.3.4",
+    "fastify": "^5.6.2",
+    "ws": "^8.22.0",
     "zod": "^4.1.12"
   },
   "devDependencies": {
-    "vitest": "^3.2.4",
-    "@botroost/worker": "workspace:*"
+    "@botroost/worker": "workspace:*",
+    "@types/ws": "^8.18.2",
+    "vitest": "^3.2.4"
   },
   "files": [
     "dist"

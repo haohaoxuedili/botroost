@@ -97,14 +97,17 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     // those back would look like a configured proxy, so omit the field entirely.
     return Object.values(proxyEnvironment).some(value => value !== '') ? { proxyEnvironment } : {};
   }
-  private async wait(check: () => Promise<boolean>) {
-    const end = Date.now() + 110_000;
+  private async settled(check: () => Promise<boolean>, timeoutMs = 110_000) {
+    const end = Date.now() + timeoutMs;
     do {
       this.signal?.throwIfAborted();
-      if (await check()) return;
+      if (await check()) return true;
       await new Promise(resolve => setTimeout(resolve, 1000));
     } while (Date.now() < end);
-    throw new Error('Runtime convergence timed out; old pod is not forcibly removed');
+    return false;
+  }
+  private async wait(check: () => Promise<boolean>) {
+    if (!await this.settled(check)) throw new Error('Runtime convergence timed out; old pod is not forcibly removed');
   }
   private async scale(name: string, replicas: number) {
     const old = await this.read('StatefulSet', name);
@@ -126,12 +129,60 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     const workload = await this.read('StatefulSet', name);
     if (!workload) throw new Error('Runtime not found');
     // Durable template marker makes replay after pod deletion idempotent.
-    // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
-    const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
+    // read() is typed for the resources this client writes; a Pod also carries status.podIP.
+    const pod = await this.read('Pod', `${name}-0`) as ObjectState | null;
     const marker = 'botroost.io/restart-operation';
+    const previousMarker = (workload as { spec?: { template?: { metadata?: { annotations?: Record<string,string> } } } }).spec?.template?.metadata?.annotations?.[marker];
     await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: workload.metadata, spec: { template: { metadata: { annotations: { [marker]: operation } } } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
-    if (pod && pod.metadata?.annotations?.[marker] !== operation) { this.owned(pod, workload.metadata!.labels!); await this.remove(pod); }
-    await this.start(name);
+    if (!pod || pod.metadata?.annotations?.[marker] === operation) return this.start(name);
+    this.owned(pod, workload.metadata!.labels!);
+    // The pod still runs the request it was created with -- a pod's resources are immutable --
+    // so it is the record of what to fall back to if the replacement cannot be placed.
+    const previous = podResources(pod);
+    await this.remove(pod);
+    if (await this.waitForReplacement(name, pod.metadata!.uid!)) return;
+    // ensure() already wrote a larger request to the template, so the replacement needs more
+    // capacity than the pod that just went away. On a node without that headroom it stays
+    // Pending: without this fallback the endpoint would simply be down, serving nothing.
+    const restored = await this.restore(name, previous, marker, previousMarker);
+    throw new Error(restored
+      ? 'The replacement workload could not be scheduled; the endpoint is running again on its previous resources'
+      : 'The replacement workload could not be scheduled and the previous resources could not be restored; operator review required');
+  }
+  /** Waits for the pod that replaced `previousUid` to run. Gives up early when the scheduler
+   *  has already rejected it: an unschedulable pod does not become runnable by waiting. */
+  private async waitForReplacement(name: string, previousUid: string) {
+    const end = Date.now() + 110_000;
+    do {
+      this.signal?.throwIfAborted();
+      const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { conditions?: { type?: string; status?: string; reason?: string }[] } }) | null;
+      if (pod && pod.metadata?.uid !== previousUid) {
+        if ((await this.inspect(name))?.state === 'running') return true;
+        const rejected = pod.status?.conditions?.some(condition => condition.type === 'PodScheduled' && condition.status === 'False' && condition.reason === 'Unschedulable');
+        if (rejected) return false;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } while (Date.now() < end);
+    return false;
+  }
+  /** Rewrites the replaced pod's resources onto the template and waits for a pod of that size,
+   *  so a request the cluster cannot satisfy still ends with the endpoint serving. */
+  private async restore(name: string, previous: Record<string, unknown>, marker: string, previousMarker: string | undefined) {
+    const current = await this.read('StatefulSet', name);
+    if (!current) return false;
+    const template = (current as { spec?: { template?: { spec?: { initContainers?: { name: string }[]; containers?: { name: string }[] } } } }).spec?.template;
+    const sized = (containers: { name: string }[] | undefined) => (containers ?? []).map(container => previous[container.name] === undefined ? container : { ...container, resources: previous[container.name] });
+    await this.objects.patch({ ...this.ref('StatefulSet', name), metadata: current.metadata, spec: { template: {
+      // Restoring the marker as well lets a retry of the same operation run again instead of
+      // being mistaken for a completed rollout.
+      metadata: { annotations: { [marker]: previousMarker ?? null } },
+      spec: { initContainers: sized(template?.spec?.initContainers), containers: sized(template?.spec?.containers) },
+    } } } as ObjectState, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
+    // The pending replacement was built from the larger request, so it has to go for the
+    // controller to create one that fits.
+    const stuck = await this.read('Pod', `${name}-0`);
+    if (stuck) { this.owned(stuck, current.metadata!.labels!); await this.remove(stuck); }
+    return this.settled(async () => (await this.inspect(name))?.state === 'running');
   }
   forceRestart(name: string, operation: string) { return this.restart(name, operation); }
   /** Removes the workload and its supporting objects but keeps the claim: replacement (image,
@@ -189,6 +240,14 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     }
     return result;
   }
+}
+/** The resources a running pod was created with, per container name. A pod cannot be resized in
+ *  place, so this is the only surviving record of what the endpoint ran on before an update. */
+function podResources(pod: ObjectState): Record<string, unknown> {
+  const containers = (pod as { spec?: { initContainers?: { name: string; resources?: unknown }[]; containers?: { name: string; resources?: unknown }[] } }).spec;
+  return Object.fromEntries([...(containers?.initContainers ?? []), ...(containers?.containers ?? [])]
+    .filter(container => container.resources !== undefined)
+    .map(container => [container.name, container.resources]));
 }
 // Parses Kubernetes resource quantities ("8073539n", "258980Ki", "2G") into base units (nanocores, bytes).
 function parseKubernetesQuantity(value: string | undefined): number {

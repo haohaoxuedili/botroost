@@ -254,6 +254,13 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
     // command instead, long after the operator thought the endpoint was created).
     const node = body.nodeId ? await db.nodeProvider(current.workspaceId, body.nodeId) : null;
     if (node && node.provider !== body.providerId && node.providerRouting !== true) throw fail(`this node serves ${node.provider} endpoints only; upgrade its agent for cross-provider routing`, 409);
+    // A node only takes an endpoint it can actually place. Requests equal limits, so an endpoint
+    // that does not fit is not "slow to start": it never schedules, and the operator learns about
+    // it long after the create returned 201. Refuse it here, while the reason is still actionable.
+    if (body.nodeId) {
+      const capacity = await db.nodeCapacity(current.workspaceId, body.nodeId, body.providerId);
+      if (capacity && !capacity.admitted && capacity.capacity) throw fail(`node has no room for another ${body.providerId} endpoint: its endpoints already reserve ${capacity.reserved.cpuMillis}m CPU / ${capacity.reserved.memoryMiB}MiB of the ${capacity.capacity.cpuMillis}m / ${capacity.capacity.memoryMiB}MiB it reports, and this one needs ${capacity.required.cpuMillis}m / ${capacity.required.memoryMiB}MiB`, 409);
+    }
     return reply.code(201).send(await db.createEndpoint(current.workspaceId, body.name, body.providerId, body.nodeId)); });
   api.get("/api/v1/endpoints/:id", async (request, reply) => { const current = await principal(request); const result = await db.endpoint(current.workspaceId, idParams.parse(request.params).id); return result ?? reply.code(404).send({ error: { code: "not_found", message: "not found" } }); });
   api.put("/api/v1/endpoints/:id/proxy", async (request, reply) => { const current = await authorize(request, "operate"); const endpointId = idParams.parse(request.params).id; const body = z.object({ proxy: proxyConfigurationSchema.nullable() }).parse(request.body); const endpoint = await db.endpoint(current.workspaceId, endpointId); if (!endpoint) throw fail("not found", 404); const idempotencyKey = z.string().min(1).max(200).parse(request.headers["idempotency-key"]); const result = await db.mutateEndpoint({ workspaceId: current.workspaceId, endpointId, actorUserId: current.userId, action: "update-endpoint-proxy", expectedGeneration: endpoint.generation, idempotencyKey, metadata: { proxy: body.proxy } }); return reply.code(202).send(result.operation); });

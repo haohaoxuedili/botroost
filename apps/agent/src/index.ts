@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { cpus, totalmem } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 import { FileAgentJournal } from "@botroost/agent-journal";
@@ -300,6 +301,10 @@ export class NodeCredentialStore {
   }
 }
 
+/** What this host can schedule. A Kubernetes agent sees the node's CPU count and total memory
+ *  even from inside a pod (cgroup limits change neither), and a Docker agent sees the host, so
+ *  one measurement describes the machine both backends place workloads on. */
+const nodeCapacity=()=>({cpuMillis:cpus().length*1000,memoryMiB:Math.round(totalmem()/(1024*1024))});
 export interface AgentCommandTransport {
   heartbeat(runtimes?: {
     endpointId: string;
@@ -351,6 +356,7 @@ export class HttpAgentTransport implements AgentCommandTransport {
       status: "online",
       sessionId:this.sessionId,
       observedAt: new Date().toISOString(),
+      capacity: nodeCapacity(),
       runtimes,
     });
   }

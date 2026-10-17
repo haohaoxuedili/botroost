@@ -26,6 +26,49 @@ describe('Kubernetes API lifecycle safety', () => {
       expect(remove.mock.calls[0]?.[6]).toEqual({ preconditions: { uid: 'original', resourceVersion: '2' } });
     } finally { read.mockRestore(); patch.mockRestore(); remove.mockRestore(); }
   }, 2000);
+  it('restores the previous resource request when the larger replacement cannot be scheduled', async () => {
+    const { config, labels } = fixture();
+    const small = { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '1', memory: '1Gi' } };
+    const large = { requests: { cpu: '2', memory: '2Gi' }, limits: { cpu: '2', memory: '2Gi' } };
+    // ensure() already wrote the larger request to the template before restart() ran.
+    let templateResources = large;
+    const workload = () => ({ apiVersion: 'apps/v1', kind: 'StatefulSet', metadata: { name: 'test', uid: 'workload-uid', resourceVersion: '1', labels },
+      spec: { replicas: 1, template: { spec: { containers: [{ name: 'protocol', image: 'example/image', resources: templateResources }] } } } });
+    let pod: Record<string, unknown> | null = { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'test-0', uid: 'original', resourceVersion: '2', labels, annotations: {} },
+      spec: { containers: [{ name: 'protocol', resources: small }] }, status: { containerStatuses: [{ name: 'protocol', state: { running: {} } }] } };
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockImplementation(async object => {
+      if (object.kind === 'StatefulSet') return workload();
+      return pod as never;
+    });
+    const patch = vi.spyOn(KubernetesObjectApi.prototype, 'patch').mockImplementation(async object => {
+      const containers = (object as { spec?: { template?: { spec?: { containers?: { resources?: unknown }[] } } } }).spec?.template?.spec?.containers;
+      const restored = containers?.[0]?.resources;
+      if (restored) templateResources = restored as typeof large;
+      return workload();
+    });
+    // The first replacement is rejected by the scheduler; the pod created after the restore runs.
+    const remove = vi.spyOn(KubernetesObjectApi.prototype, 'delete').mockImplementation(async object => {
+      const wasOriginal = (pod?.metadata as { uid?: string } | undefined)?.uid === 'original';
+      pod = wasOriginal
+        ? { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'test-0', uid: 'pending', resourceVersion: '3', labels, annotations: { 'botroost.io/restart-operation': 'op' } },
+            spec: { containers: [{ name: 'protocol', resources: large }] },
+            status: { conditions: [{ type: 'PodScheduled', status: 'False', reason: 'Unschedulable' }] } }
+        : { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'test-0', uid: 'restored', resourceVersion: '4', labels, annotations: { 'botroost.io/restart-operation': 'op' } },
+            spec: { containers: [{ name: 'protocol', resources: templateResources }] }, status: { containerStatuses: [{ name: 'protocol', state: { running: {} } }] } };
+      void object;
+      return {};
+    });
+    try {
+      await expect(new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi' }, undefined, config).restart('test', 'op'))
+        .rejects.toThrow(/running again on its previous resources/);
+      // The template was rewritten to the 1 vCPU / 1 GiB the endpoint was actually running on.
+      expect(templateResources).toEqual(small);
+      // Original pod, the unschedulable replacement, and nothing else: no third pod was needed.
+      // The unschedulable replacement was deleted and replaced by a pod of the old size.
+      expect((pod as { metadata?: { uid?: string } })?.metadata?.uid).toBe('restored');
+      expect(remove).toHaveBeenCalledTimes(2);
+    } finally { read.mockRestore(); patch.mockRestore(); remove.mockRestore(); }
+  }, 20000);
   it('maps pod-metric UIDs to resource samples and tolerates unknown quantities', async () => {
     const { config } = fixture();
     const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi' }, undefined, config);

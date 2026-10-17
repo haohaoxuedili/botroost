@@ -33,6 +33,9 @@ export interface RuntimeDriver {
   restart(name: string, operationId: string): Promise<void>;
   forceRestart(name: string, operationId: string): Promise<void>;
   delete(name: string): Promise<void>;
+  /** Drop the workload's durable volume. Only an explicit endpoint deletion calls this;
+   *  delete() retains it so a replaced runtime keeps its login state. */
+  deleteData?(name: string): Promise<void>;
   logs: DockerClient['logs'];
   stats?: DockerClient['stats'];
   /** Run a command inside the workload's protocol container. Optional: a backend that

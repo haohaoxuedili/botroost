@@ -12,6 +12,7 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseSnowlumaConnectionLine, parseSnowlumaTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
+import { loginUrl } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -189,7 +190,8 @@ export class SnowLumaRuntime {
     if (existing && !this.ownsContainer(existing, command)) throw new Error("SnowLuma container is not owned by this endpoint");
     if (command.action === "delete") {
       await onProgress({ phase: "removing-runtime", percent: 55, message: "Removing container and persisted runtime data" });
-      if (existing) await docker.remove(name);
+      // Explicit endpoint deletion is the only path allowed to discard durable state.
+      if (existing) await docker.remove(name, { discardData: true });
       await onProgress({ phase: "removing-runtime", percent: 62, message: "Removing persisted host runtime data" });
       await docker.removeHostEndpoint(resolve(this.options.hostStateDirectory ?? this.options.stateDirectory), command.endpointId, SNOWLUMA_IMAGE);
       await onProgress({ phase: "removing-runtime", percent: 70, message: "Removing agent runtime state" });
@@ -267,24 +269,30 @@ export class SnowLumaRuntime {
       const hostQq = this.containerMounts.qq ?? this.hostEndpointDirectory(command.endpointId, "qq");
       const hostConfig = this.containerMounts.config ?? this.hostEndpointDirectory(command.endpointId, "config");
       const storage = this.storage.for(name);
-      await storage.ensureDirectory(hostQq);
-      await onProgress({ phase: "preparing-runtime", percent: 45, message: "Preparing SnowLuma configuration storage" });
-      await storage.ensureDirectory(join(hostConfig, "config"));
-      // The SnowLuma image runs its main process as an unprivileged user (uid SNOWLUMA_UID,
-      // default 1000) with cwd /app/snowluma-data, while its entrypoint writes config/runtime.json
-      // as root. Bind-mount host directories world-writable and pre-seed runtime.json with mode
-      // 0o666 so the entrypoint's root-owned overwrite keeps it writable by the main process.
+      const runtimeConfigPath = join(hostConfig, "config", "runtime.json");
+      const seedRuntimeConfig = async () => {
+        try {
+          // Never clobber an existing runtime.json: only seed it when absent.
+          const current = await storage.readFile(runtimeConfigPath).catch(() => null);
+          if (current === null) await storage.writeFile(runtimeConfigPath, `${JSON.stringify({ webuiPort: WEBUI_CONTAINER_PORT }, null, 2)}\n`);
+        } catch { /* pre-seeding runtime.json is best-effort; the container entrypoint recreates it */ }
+      };
+      // Only Docker needs the bind sources to exist before the container starts. On Kubernetes
+      // the claim's subPath directories come from the workload's init container and the pod
+      // does not exist yet, so preparing them through exec would abort the create.
       if (this.storage.kind === "local") {
+        await storage.ensureDirectory(hostQq);
+        await onProgress({ phase: "preparing-runtime", percent: 45, message: "Preparing SnowLuma configuration storage" });
+        await storage.ensureDirectory(join(hostConfig, "config"));
+        // The SnowLuma image runs its main process as an unprivileged user (uid SNOWLUMA_UID,
+        // default 1000) with cwd /app/snowluma-data, while its entrypoint writes config/runtime.json
+        // as root. Bind-mount host directories world-writable and pre-seed runtime.json with mode
+        // 0o666 so the entrypoint's root-owned overwrite keeps it writable by the main process.
         await chmod(hostQq, 0o777).catch(() => {});
         await chmod(hostConfig, 0o777).catch(() => {});
         await chmod(join(hostConfig, "config"), 0o777).catch(() => {});
+        await seedRuntimeConfig();
       }
-      const runtimeConfigPath = join(hostConfig, "config", "runtime.json");
-      try {
-        // Never clobber an existing runtime.json: only seed it when absent.
-        const existing = await storage.readFile(runtimeConfigPath).catch(() => null);
-        if (existing === null) await storage.writeFile(runtimeConfigPath, `${JSON.stringify({ webuiPort: WEBUI_CONTAINER_PORT }, null, 2)}\n`);
-      } catch { /* pre-seeding runtime.json is best-effort; the container entrypoint recreates it */ }
       await onProgress({ phase: "creating-container", percent: 55, message: "Creating SnowLuma container" });
       const ports = snowlumaLoginPorts(command.endpointId);
       await docker.create({
@@ -310,7 +318,12 @@ export class SnowLumaRuntime {
           { hostPort: String(ports.novncPort), containerPort: NOVNC_CONTAINER_PORT },
           { hostPort: String(ports.webuiPort), containerPort: WEBUI_CONTAINER_PORT },
         ],
+        // OneBot is reached over the container network and is never published on Docker; a
+        // Kubernetes Service only routes declared ports, so declare it here as well.
+        exposePorts: [ONEBOT_HTTP_PORT],
       });
+      // The pod exists from here on, which is when a Kubernetes claim becomes writable.
+      if (this.storage.kind !== "local") await seedRuntimeConfig();
     }
     if (command.action === "stop" && existing) { await onProgress({ phase: "stopping-container", percent: 70, message: "Stopping SnowLuma container" }); await docker.stop(name); }
     else if (command.action === "force-restart") {
@@ -586,7 +599,10 @@ export class SnowLumaRuntime {
     ]);
     const ports = snowlumaLoginPorts(command.endpointId);
     const webui = await this.webuiCredentials(command.endpointId);
-    const loginGuide = { novncPort: ports.novncPort, webuiPort: ports.webuiPort, ...webui };
+    const webuiUrl = loginUrl(ports.webuiPort), novncUrl = loginUrl(ports.novncPort);
+    // Kubernetes cannot publish host ports, so the browser needs the cluster entry point; when
+    // none is configured the ports are still reported for an operator with port-forward access.
+    const loginGuide = { novncPort: ports.novncPort, webuiPort: ports.webuiPort, ...(webuiUrl ? { webuiUrl } : {}), ...(novncUrl ? { novncUrl } : {}), ...webui };
     if (statusSettled.status === "rejected") {
       // SnowLuma only starts its OneBot HTTP server (container port 3000) after QQ
       // logs in, so an unreachable provider while the container is running means

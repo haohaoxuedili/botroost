@@ -22,6 +22,8 @@ import { type KubernetesProfile } from './kubernetes-resources.js';
  * logs/stats) so the ownership checks, convergence waits and template-marker idempotency
  * that NapCat already relies on are shared instead of duplicated.
  */
+/** Upper bound for a single exec round trip; provider commands are serial and must not hang. */
+const EXEC_TIMEOUT_MS = 60_000;
 export class KubernetesDockerClient implements DockerClient {
   private core: CoreV1Api;
   private execClient: Exec;
@@ -43,12 +45,19 @@ export class KubernetesDockerClient implements DockerClient {
   // mount came from to keep the same layout across restarts. The bind source is the
   // per-endpoint directory, and its basename is the subPath the claim stores it under.
   private remember(name: string, mounts: DockerCreateInput['mounts']) {
-    this.volumes.set(name, mounts.map(mount => ({ name: this.subPathFor(mount.source), target: mount.target })));
+    this.volumes.set(name, mounts.map(mount => ({ name: this.subPathFor(mount.source, mount.target), target: mount.target })));
   }
-  private subPathFor(source: string) {
+  // The bind source on Docker is a directory the agent owns, and its basename is the subPath
+  // on Kubernetes -- except for hidden directories like `.config`, which are not valid
+  // subPaths. Those fall back to the mount target instead, so the mapping stays deterministic
+  // and the reclaiming adapter derives the same subPaths from the live StatefulSet.
+  private subPathFor(source: string, target?: string) {
     const base = source.replace(/\/+$/, '').split('/').pop() ?? '';
-    if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(base)) throw new Error(`Invalid volume source directory: ${source}`);
-    return base as RuntimeVolume['name'];
+    if (/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(base)) return base as RuntimeVolume['name'];
+    const derived = (target ?? '').replace(/\/+$/, '').split('/').filter(Boolean).pop() ?? '';
+    const normalized = derived.replace(/^\.+/, '').replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '');
+    if (!normalized) throw new Error(`Cannot derive a volume subPath from ${source} (${target ?? 'no target'})`);
+    return normalized as RuntimeVolume['name'];
   }
   // Previous runs of this adapter (and the provider's own mount list) agree on these
   // targets; recovering the mapping from the live StatefulSet keeps restarts working even
@@ -74,8 +83,14 @@ export class KubernetesDockerClient implements DockerClient {
     this.signal?.throwIfAborted();
     this.remember(input.name, input.mounts);
     // Docker publishes host ports; Kubernetes routes the same container ports through the
-    // Service, which is why the provider can reach them at the inspect() address.
-    const ports = (input.publishedPorts ?? []).map(port => ({ name: `port-${port.containerPort}`, port: Number(port.containerPort) }));
+    // Service, which is why the provider can reach them at the inspect() address. Ports the
+    // provider reaches over the container network (OneBot's HTTP API) are not published on
+    // Docker, but they still have to be Service ports or the provider cannot reach them.
+    const servicePorts = [...new Set([
+      ...(input.publishedPorts ?? []).map(port => Number(port.containerPort)),
+      ...(input.exposePorts ?? []),
+    ])].filter(port => Number.isInteger(port) && port > 0 && port < 65536);
+    const ports = servicePorts.map(port => ({ name: `port-${port}`, port }));
     const spec: RuntimeSpec = {
       name: input.name,
       image: input.image,
@@ -98,7 +113,12 @@ export class KubernetesDockerClient implements DockerClient {
   // resolve a pod UID back to the workload that owns it.
   private async resolveName(reference: string): Promise<string> {
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(reference)) return reference;
-    // UID, not a name: find the owning Pod. A direct read covers the case where a provider
+    // A UID is either a pod's (create()/inspect() return the live pod) or a StatefulSet's
+    // (inspect() falls back to it while the workload is stopped or its pod is being
+    // replaced). Both are resolved, because a stopped workload legitimately has no pod.
+    const workload = await this.findWorkloadByUid(reference);
+    if (workload) return workload;
+    // Not a workload UID: find the owning Pod. A direct read covers the case where a provider
     // passed a pod name; the label scan covers ids handed back by inspect().
     const read = await this.core.readNamespacedPod({ name: reference, namespace: this.profile.namespace }).then(pod => pod.metadata).catch(() => null);
     const metadata = read ?? await this.core.listNamespacedPod({ namespace: this.profile.namespace })
@@ -109,15 +129,27 @@ export class KubernetesDockerClient implements DockerClient {
     if (!owner) throw new Error(`No Kubernetes workload owns container ${reference}`);
     return owner;
   }
+  /** Ownership check for ids that outlived their pod: only workloads this agent labelled count. */
+  private async findWorkloadByUid(uid: string): Promise<string | null> {
+    const list = await this.objects.list('apps/v1', 'StatefulSet', this.profile.namespace).catch(() => null);
+    const match = list?.items?.find(item => item.metadata?.uid === uid && item.metadata?.labels?.['botroost.endpoint_id']);
+    return match?.metadata?.name ?? null;
+  }
   async start(name: string): Promise<void> { return this.driver.start(await this.resolveName(name)); }
   async stop(name: string): Promise<void> { return this.driver.stop(await this.resolveName(name)); }
   async restart(name: string): Promise<void> { return this.driver.restart(await this.resolveName(name), `docker-restart-${Date.now()}`); }
   async kill(name: string): Promise<void> { return this.driver.forceRestart(await this.resolveName(name), `docker-kill-${Date.now()}`); }
-  async remove(name: string): Promise<void> { return this.driver.delete(await this.resolveName(name)); }
-  // Docker deletes the endpoint's host directory. Kubernetes claims are retained by
-  // policy (whenDeleted/whenScaled=Retain) so a delete command can never destroy the
-  // QQ login state; ownership removal is the explicit delete above.
-  async removeHostEndpoint(): Promise<void> { /* intentionally retained on Kubernetes */ }
+  async remove(name: string, options?: { discardData?: boolean }): Promise<void> {
+    const workload = await this.resolveName(name);
+    // Replacing a workload for a new image/resources must not cost the user their QQ login,
+    // so the claim is only dropped when the endpoint itself is being deleted.
+    await this.driver.delete(workload);
+    // Claim last: the pod still mounts it until the workload is gone.
+    if (options?.discardData) await this.driver.deleteData?.(workload).catch(() => {});
+  }
+  // Docker deletes the endpoint's host directory. On Kubernetes the claim is the equivalent
+  // durable state and is removed by remove(..., { discardData: true }) above.
+  async removeHostEndpoint(): Promise<void> { /* claim removal is handled by remove() */ }
   logs(name: string, options: { tail: number; sinceSeconds: number; timestamps?: boolean; maxBytes?: number }) { return this.driver.logs(name, options); }
   async exec(name: string, args: string[], stdin?: string): Promise<{ stdout: string; stderr: string }> {
     this.signal?.throwIfAborted();
@@ -142,12 +174,29 @@ export class KubernetesDockerClient implements DockerClient {
         if (cause?.message) exitCode = Number(cause.message);
       },
     );
-    await new Promise<void>((resolve, reject) => {
-      socket.on('close', () => resolve());
-      socket.on('error', reject);
-    });
+    await this.awaitClose(socket);
     if (exitCode !== null && Number.isFinite(exitCode) && exitCode !== 0) throw new Error(`exec failed (exit ${exitCode}): ${(err || out).trim()}`);
     return { stdout: out, stderr: err };
+  }
+  /** A wedged exec (API server or network stall) must not hold the provider's serial command
+   *  queue forever: the wait races an abort-aware deadline and destroys the socket on expiry. */
+  private awaitClose(socket: { on(event: 'close', handler: () => void): unknown; on(event: 'error', handler: (error: Error) => void): unknown; terminate(): void }) {
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.signal?.removeEventListener('abort', abort);
+        if (error) { socket.terminate(); reject(error); } else resolve();
+      };
+      const abort = () => finish(new Error('exec aborted'));
+      const timer = setTimeout(() => finish(new Error(`exec timed out after ${EXEC_TIMEOUT_MS}ms`)), EXEC_TIMEOUT_MS);
+      if (this.signal?.aborted) { finish(new Error('exec aborted')); return; }
+      this.signal?.addEventListener('abort', abort, { once: true });
+      socket.on('close', () => finish());
+      socket.on('error', (error: Error) => finish(error));
+    });
   }
   // Resource telemetry via metrics.k8s.io, keyed by pod UID to match inspect().id.
   async stats(podUids: string[]): Promise<Map<string, DockerResourceSample>> {

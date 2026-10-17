@@ -44,19 +44,49 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   }
   async ensure(spec: RuntimeSpec) {
     const resources = kubernetesResources(spec, this.profile);
-    for (const object of [resources.secret, resources.pvc, resources.service, resources.governing, resources.workload]) await this.put(object);
+    for (const object of [resources.secret, resources.pvc, resources.service, resources.governing, resources.networkPolicy, resources.workload].filter(Boolean)) await this.put(object!);
   }
   async inspect(name: string): Promise<DockerInspectResult | null> {
     const workload = await this.read('StatefulSet', name);
     if (!workload) return null;
     const pod = await this.read('Pod', `${name}-0`);
-    const container = workload.spec.template.spec.containers[0];
+    const template = (workload as { spec: { template: { spec: { containers: { image: string; resources?: { limits?: Record<string, string>; requests?: Record<string, string> }; envFrom?: { secretRef?: { name?: string } }[] }[] } } } }).spec.template.spec;
+    const container = template.containers[0]!;
     const running = workload.spec.replicas === 1 && !pod?.metadata?.deletionTimestamp && !!pod?.status?.containerStatuses?.some(c => c.name === 'protocol' && c.state?.running);
+    const envSecret = container.envFrom?.find(source => source.secretRef?.name)?.secretRef?.name;
     return { id: pod?.metadata?.uid ?? workload.metadata!.uid!, name, image: container.image,
       state: running ? 'running' : workload.spec.replicas === 0 ? 'exited' : 'created',
       ipAddress: running ? `${name}.${this.profile.namespace}.svc` : null,
       labels: workload.metadata!.labels ?? {},
+      ...this.reportedResources(container.resources?.limits, container.resources?.requests),
+      ...await this.reportedProxy(envSecret),
     };
+  }
+  /** Providers compare inspect() against the desired configuration to detect drift, so the
+   *  limits they asked for have to come back or every reconcile looks like a change. */
+  private reportedResources(limits?: Record<string, string>, requests?: Record<string, string>) {
+    const cpu = limits?.cpu ?? requests?.cpu;
+    const memory = limits?.memory ?? requests?.memory;
+    const cpuMillis = cpu === undefined ? undefined : parseKubernetesQuantity(cpu) / 1_000_000;
+    const memoryMiB = memory === undefined ? undefined : Math.round(parseKubernetesQuantity(memory) / (1024 * 1024));
+    if (cpuMillis === undefined || memoryMiB === undefined) return {};
+    // Kubernetes states one memory figure; Docker echoes it as both, so report the same.
+    return { resources: { cpuMillis, memoryMiB, memorySwapMiB: memoryMiB } };
+  }
+  /** Proxy settings are delivered through envFrom (the rendered Secret), which is also where
+   *  the provider expects to find them again when it compares for drift. */
+  private async reportedProxy(secretName: string | undefined) {
+    if (!secretName) return {};
+    const object = await this.read('Secret', secretName) as ObjectState | null;
+    if (!object?.data) return {};
+    const keys = ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy'];
+    const proxyEnvironment = Object.fromEntries(keys.map(key => {
+      const raw = object.data?.[key];
+      return [key, raw === undefined ? '' : Buffer.from(raw, 'base64').toString('utf8')];
+    }) as [string, string][]);
+    // An endpoint with no proxy configured keeps a Secret full of empty strings; reporting
+    // those back would look like a configured proxy, so omit the field entirely.
+    return Object.values(proxyEnvironment).some(value => value !== '') ? { proxyEnvironment } : {};
   }
   private async wait(check: () => Promise<boolean>) {
     const end = Date.now() + 110_000;
@@ -94,19 +124,38 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     await this.start(name);
   }
   forceRestart(name: string, operation: string) { return this.restart(name, operation); }
+  /** Removes the workload and its supporting objects but keeps the claim: replacement (image,
+   *  resources, proxy) must not discard the login state stored on the endpoint's volume. */
   async delete(name: string) {
     const workload = await this.read('StatefulSet', name);
     if (!workload) throw new Error('Runtime ownership unavailable; retained resources require operator review');
     await this.stop(name);
     // Workload removed last so interrupted cleanup retains ownership evidence.
-    for (const [kind, resourceName] of [['Service', name], ['Service', `${name}-head`], ['Secret', name], ['PersistentVolumeClaim', name], ['StatefulSet', name]]) {
+    for (const [kind, resourceName] of [['NetworkPolicy', `${name}-ingress`], ['Service', name], ['Service', `${name}-head`], ['Secret', name], ['StatefulSet', name]]) {
       const object = await this.read(kind!, resourceName!);
       if (object) { this.owned(object, workload.metadata!.labels!); await this.remove(object); }
     }
   }
+  /** Explicit endpoint deletion, which is the only path allowed to destroy durable data. */
+  async deleteData(name: string) {
+    const claim = await this.read('PersistentVolumeClaim', name);
+    if (!claim) return;
+    // The workload is gone by now, so its labels are the only ownership evidence left.
+    this.owned(claim, claim.metadata!.labels!);
+    await this.remove(claim);
+  }
   async logs(name: string, options: { tail: number; sinceSeconds: number; timestamps?: boolean; maxBytes?: number }) {
-    const text = await this.core.readNamespacedPodLog({ name: `${name}-0`, namespace: this.profile.namespace, container: 'protocol', tailLines: options.tail, sinceSeconds: options.sinceSeconds, timestamps: options.timestamps ?? false, limitBytes: options.maxBytes ?? 1048576 });
-    return text;
+    const pod = await this.read('Pod', `${name}-0`);
+    // A stopped endpoint has been scaled to zero, which removes the pod and with it the pod
+    // log. Report that instead of failing the operator's diagnostic request.
+    if (!pod || pod.metadata?.deletionTimestamp) return '';
+    try {
+      return await this.core.readNamespacedPodLog({ name: `${name}-0`, namespace: this.profile.namespace, container: 'protocol', tailLines: options.tail, sinceSeconds: options.sinceSeconds, timestamps: options.timestamps ?? false, limitBytes: options.maxBytes ?? 1048576 });
+    } catch (error) {
+      // The pod can disappear between the read and the log request; that is the same answer.
+      if ((error as { code?: number }).code === 404) return '';
+      throw error;
+    }
   }
   // Resource telemetry via metrics.k8s.io: keys are pod UIDs, matching inspect()'s `id`.
   async stats(podUids: string[], signal?: AbortSignal) {

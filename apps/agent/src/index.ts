@@ -103,6 +103,9 @@ export interface DockerCreateInput {
   securityOpt?: string[];
   shmBytes?: number;
   publishedPorts?: { hostPort: string; containerPort: string }[];
+  /** Container ports the provider reaches over the container network but never publishes.
+   *  Docker needs no declaration for these; a Kubernetes Service does. */
+  exposePorts?: number[];
 }
 export interface DockerInspectResult {
   id: string;
@@ -119,7 +122,8 @@ export interface DockerClient {
   stats?: DockerStatsReader;
   inspect(name: string): Promise<DockerInspectResult | null>;
   create(input: DockerCreateInput): Promise<{ id: string }>;
-  remove(name: string): Promise<void>;
+  /** `discardData` is only set on explicit endpoint deletion; replacement keeps durable state. */
+  remove(name: string, options?: { discardData?: boolean }): Promise<void>;
   removeHostEndpoint(root: string, endpointId: string, image: string): Promise<void>;
   start(name: string): Promise<void>;
   stop(name: string): Promise<void>;
@@ -1223,11 +1227,17 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
   // workload lifecycle, convergence and template idempotency stay in one implementation.
   // Their endpoint data lives on a PVC the agent pod cannot mount, so file access is routed
   // through pods/exec (PodRuntimeStorage) at the paths the protocol container sees.
+  const agentNamespace = process.env.AGENT_NAMESPACE?.trim()
+    || (process.env.POD_NAMESPACE ?? "").trim()
+    || undefined;
   let kubernetesProfile: ConstructorParameters<typeof KubernetesRuntimeDriver>[0] | undefined;
   const kubernetesProfileFor = () => {
     kubernetesProfile ??= {
       namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(),
       volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi",
+      // The namespace this agent pod runs in; runtime Services are fenced to it so other
+      // cluster workloads cannot reach an endpoint's UI or remote-desktop ports.
+      ...(agentNamespace ? { agentNamespace } : {}),
       ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}),
     };
     return kubernetesProfile;

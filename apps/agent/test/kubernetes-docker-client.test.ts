@@ -3,6 +3,8 @@ import { KubeConfig } from '@kubernetes/client-node';
 import { KubernetesDockerClient } from '../src/runtime/kubernetes-docker.js';
 import { PodRuntimeStorage, LocalRuntimeStorage, StorageFileMissing } from '../src/runtime/storage.js';
 import type { RuntimeDriver, RuntimeSpec } from '../src/runtime/types.js';
+import { SnowLumaRuntime } from '../src/snowluma-runtime.js';
+import { LLBotRuntime } from '../src/llbot-runtime.js';
 
 /** Minimal RuntimeDriver that records what the adapter asks it to do. */
 function fakeDriver(overrides: Partial<RuntimeDriver> = {}) {
@@ -84,15 +86,57 @@ describe('KubernetesDockerClient', () => {
     expect(created.id).toBe('pod-uid-1');
   });
 
-  it('rejects a bind-mount source that cannot become a legal subPath', async () => {
+  it('maps a hidden bind source like .config onto a legal subPath instead of failing', async () => {
+    const { driver, ensured } = fakeDriver();
+    const client = new KubernetesDockerClient(driver, { namespace: 'rt', volumeSize: '2Gi' }, undefined, kubeConfig());
+    // SnowLuma's Kubernetes mount target is /app/.config; `.config` is not a legal subPath,
+    // so the adapter derives the name from the target. Failing here aborted every create.
+    await client.create({
+      name: 'snowluma-e3', image: 'x', labels: {}, environment: {},
+      mounts: [{ type: 'bind', source: '/app/.config', target: '/app/.config' }],
+      hostConfig: { networkMode: 'bridge', portBindings: {} },
+      resources: { cpuMillis: 1, memoryMiB: 1 },
+    } as never);
+    expect(ensured[0]!.volumes).toEqual([{ name: 'config', target: '/app/.config' }]);
+  });
+
+  it('rejects a mount whose target yields no legal subPath at all', async () => {
     const { driver } = fakeDriver();
     const client = new KubernetesDockerClient(driver, { namespace: 'rt', volumeSize: '2Gi' }, undefined, kubeConfig());
     await expect(client.create({
       name: 'bad', image: 'x', labels: {}, environment: {},
-      mounts: [{ type: 'bind', source: '/var/lib/agent/e3/Not_Valid', target: '/app/data' }],
+      mounts: [{ type: 'bind', source: '/var/lib/agent/e3/___', target: '/__' }],
       hostConfig: { networkMode: 'bridge', portBindings: {} },
       resources: { cpuMillis: 1, memoryMiB: 1 },
-    } as never)).rejects.toThrow(/Invalid volume source directory/);
+    } as never)).rejects.toThrow(/Cannot derive a volume subPath/);
+  });
+
+  it('routes every port the provider talks to, including unpublished OneBot', async () => {
+    const { driver, ensured } = fakeDriver();
+    const client = new KubernetesDockerClient(driver, { namespace: 'rt', volumeSize: '2Gi' }, undefined, kubeConfig());
+    await client.create({
+      name: 'llbot-e4', image: 'x', labels: {}, environment: {},
+      mounts: [{ type: 'bind', source: '/app/llbot/data', target: '/app/llbot/data' }],
+      hostConfig: { networkMode: 'bridge', portBindings: {} },
+      resources: { cpuMillis: 1, memoryMiB: 1 },
+      publishedPorts: [{ hostPort: '3380', containerPort: '3080' }],
+      // OneBot HTTP is never published on Docker, but a Service only routes declared ports.
+      exposePorts: [3000],
+    } as never);
+    expect(ensured[0]!.ports).toEqual([{ name: 'port-3080', port: 3080 }, { name: 'port-3000', port: 3000 }]);
+  });
+
+  it('keeps the claim when a workload is replaced and drops it on explicit deletion', async () => {
+    const deletes: string[] = [];
+    const { driver } = fakeDriver({
+      delete: vi.fn(async (name: string) => { deletes.push(`workload:${name}`); }),
+      deleteData: vi.fn(async (name: string) => { deletes.push(`data:${name}`); }),
+    });
+    const client = new KubernetesDockerClient(driver, { namespace: 'rt', volumeSize: '2Gi' }, undefined, kubeConfig());
+    await client.remove('snowluma-e5');
+    expect(deletes).toEqual(['workload:snowluma-e5']);
+    await client.remove('snowluma-e5', { discardData: true });
+    expect(deletes).toEqual(['workload:snowluma-e5', 'workload:snowluma-e5', 'data:snowluma-e5']);
   });
 });
 
@@ -102,24 +146,31 @@ describe('PodRuntimeStorage', () => {
     const runtime = {
       exec: vi.fn(async (name: string, args: string[], stdin?: string) => {
         calls.push({ name, args, ...(stdin === undefined ? {} : { stdin }) });
-        // args is ['/bin/sh', '-c', <script>]
+        // args is ['/bin/sh', '-c', <script>]. The mock refuses any path it does not expect,
+        // so a wrong read or listing path fails here instead of passing on identical output.
         const script = args[2] ?? '';
-        if (script.startsWith('cat ')) return { stdout: '{"token":"secret"}\n', stderr: '' };
-        if (script.startsWith('ls -1A ')) return { stdout: 'onebot11.json\nconfig\n', stderr: '' };
-        return { stdout: '', stderr: '' };
+        if (script === "cat '/app/snowluma-data/config/onebot11.json'") return { stdout: '{"token":"secret"}\n', stderr: '' };
+        if (script === "ls -1A '/app/snowluma-data/config'") return { stdout: 'onebot11.json\nconfig\n', stderr: '' };
+        if (script.startsWith('base64 -d > ')) return { stdout: '', stderr: '' };
+        throw new Error(`unexpected exec: ${script}`);
       }),
     };
     const storage = new PodRuntimeStorage(runtime).for('snowluma-e1');
 
     expect(await storage.readdir('/app/snowluma-data/config')).toEqual(['onebot11.json', 'config']);
     expect(await storage.readFile('/app/snowluma-data/config/onebot11.json')).toBe('{"token":"secret"}\n');
+    expect(calls.map(call => call.args[2])).toEqual([
+      "ls -1A '/app/snowluma-data/config'",
+      "cat '/app/snowluma-data/config/onebot11.json'",
+    ]);
 
-    // Writes are base64-encoded so JSON containing quotes/newlines survives the shell hop.
+    // File content travels on stdin, never on the command line: an OneBot access token in the
+    // config must not be visible in the exec request or the container's process list.
     await storage.writeFile('/app/snowluma-data/config/onebot11.json', '{"a":"it\'s \"quoted\"\n"}');
     const write = calls.at(-1)!;
-    const encoded = /printf %s '([A-Za-z0-9+/=]+)' \| base64 -d > '([^']+)'/.exec(write.args[2]!)!;
-    expect(Buffer.from(encoded[1]!, 'base64').toString('utf8')).toBe('{"a":"it\'s \"quoted\"\n"}');
-    expect(encoded[2]).toBe('/app/snowluma-data/config/onebot11.json');
+    expect(write.args[2]).toBe("base64 -d > '/app/snowluma-data/config/onebot11.json'");
+    expect(write.stdin).toBe(Buffer.from('{"a":"it\'s \"quoted\"\n"}', 'utf8').toString('base64'));
+    expect(write.args[2]).not.toContain(write.stdin);
 
     // Every call is addressed at the workload the scope was created for.
     expect(calls.every(call => call.name === 'snowluma-e1')).toBe(true);
@@ -131,6 +182,15 @@ describe('PodRuntimeStorage', () => {
     await expect(storage.readFile('/app/x.json')).rejects.toBeInstanceOf(StorageFileMissing);
     // A readdir of an absent directory is an empty listing, matching the local backend.
     expect(await storage.readdir('/app/absent')).toEqual([]);
+  });
+
+  it('propagates exec failures that are not a missing path', async () => {
+    // A pod that is restarting or an API server that is unreachable must not be mistaken for
+    // "the endpoint has no configuration yet".
+    const runtime = { exec: vi.fn(async () => { throw new Error('exec failed (exit 137): pod is terminating'); }) };
+    const storage = new PodRuntimeStorage(runtime).for('llbot-e1');
+    await expect(storage.readFile('/app/x.json')).rejects.toThrow(/pod is terminating/);
+    await expect(storage.readdir('/app/config')).rejects.toThrow(/pod is terminating/);
   });
 
   it('creates directories world-writable so the image user can write them', async () => {
@@ -147,5 +207,15 @@ describe('LocalRuntimeStorage', () => {
     // A directory that does not exist yet is a normal first-run condition.
     expect(await storage.for('unused').readdir('/nonexistent/botroost-test-dir')).toEqual([]);
     await expect(storage.for('unused').readFile('/nonexistent/botroost-test-dir/x.json')).rejects.toBeInstanceOf(StorageFileMissing);
+  });
+
+  it('is what the providers use when no storage option is supplied', async () => {
+    // Constructing the real providers is the only way to catch a regression in their default:
+    // a docker-backed agent must keep reading the host filesystem directly.
+    const docker = { inspect: vi.fn(async () => null) } as never;
+    const snowluma = new SnowLumaRuntime({ docker, stateDirectory: '/nonexistent/botroost-test', networkMode: 'bridge' });
+    const llbot = new LLBotRuntime({ docker, stateDirectory: '/nonexistent/botroost-test', networkMode: 'bridge' });
+    expect((snowluma as unknown as { storage: { kind: string } }).storage.kind).toBe('local');
+    expect((llbot as unknown as { storage: { kind: string } }).storage.kind).toBe('local');
   });
 });

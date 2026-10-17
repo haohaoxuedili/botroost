@@ -10,6 +10,8 @@ import {
   type RuntimeCommand,
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseLLBotConnectionLine, parseLLBotTrafficLine } from "./traffic.js";
+import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
+import { loginUrl } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -106,13 +108,21 @@ export class LLBotRuntime {
     fetcher?: FetchLike;
     signal?: AbortSignal;
     operationTimeoutMs?: number;
+    /** Reaches the endpoint's durable data. Defaults to the agent host (Docker backend). */
+    storage?: RuntimeStorage;
+    /** Kubernetes backend: the in-container mount target for each volume name. */
+    containerMounts?: Record<string, string>;
   }) {
     this.networkMode = options.networkMode ?? process.env.LLBOT_DOCKER_NETWORK ?? "bridge";
     this.containerPrefix = options.containerPrefix ?? "botroost-llbot";
     if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(this.networkMode) || this.networkMode === "host" || this.networkMode.startsWith("container:")) throw new Error("LLBot docker network is invalid");
     if (!containerPrefixPattern.test(this.containerPrefix)) throw new Error("container prefix is invalid");
     this.fetcher = options.fetcher ?? globalThis.fetch;
+    this.storage = options.storage ?? new LocalRuntimeStorage();
+    this.containerMounts = options.containerMounts ?? {};
   }
+  private readonly storage: RuntimeStorage;
+  private readonly containerMounts: Record<string, string>;
   private commandStatePath() { return join(this.options.stateDirectory, "runtime-commands.json"); }
   private async loadCommands() {
     if (this.commandsLoaded) return;
@@ -175,7 +185,8 @@ export class LLBotRuntime {
     if (existing && !this.ownsContainer(existing, command)) throw new Error("LLBot container is not owned by this endpoint");
     if (command.action === "delete") {
       await onProgress({ phase: "removing-runtime", percent: 55, message: "Removing container and persisted runtime data" });
-      if (existing) await docker.remove(name);
+      // Explicit endpoint deletion is the only path allowed to discard durable state.
+      if (existing) await docker.remove(name, { discardData: true });
       await onProgress({ phase: "removing-runtime", percent: 62, message: "Removing persisted host runtime data" });
       await docker.removeHostEndpoint(resolve(this.options.hostStateDirectory ?? this.options.stateDirectory), command.endpointId, LLBOT_IMAGE);
       await onProgress({ phase: "removing-runtime", percent: 70, message: "Removing agent runtime state" });
@@ -208,7 +219,7 @@ export class LLBotRuntime {
       this.commands.set(command.endpointId, command);
       await this.persistCommands();
       await onProgress({ phase: "applying-configuration", percent: 70, message: "Writing OneBot WebSocket configuration" });
-      await this.writeOneBotWebsockets(found.path, found.config, clients, servers);
+      await this.writeOneBotWebsockets(command.endpointId, found.path, found.config, clients, servers);
       await onProgress({ phase: "applying-configuration", percent: 80, message: "Reloading the LLBot runtime" });
       // LLBot reads its protocol configuration at start; restart the container. The QQ
       // login session is persisted under /app/llbot/data and survives the restart.
@@ -235,9 +246,13 @@ export class LLBotRuntime {
     if (command.action !== "stop" && (!existing || existing.image !== LLBOT_IMAGE || resourceDrift || proxyDrift)) {
       if (existing) { await onProgress({ phase: "preparing-runtime", percent: 35, message: "Replacing outdated LLBot container" }); await docker.remove(name); }
       await onProgress({ phase: "preparing-runtime", percent: 40, message: "Preparing runtime image and storage" });
-      const hostData = this.hostEndpointDirectory(command.endpointId, "data");
-      await mkdir(hostData, { recursive: true, mode: 0o777 });
-      await chmod(hostData, 0o777).catch(() => {});
+      // The protocol pod mounts the endpoint's data volume at this path; on Docker it is the
+      // host directory handed to the container as a bind mount.
+      const dataMount = this.containerMounts.data ?? (this.storage.kind === "pod" ? "/data" : this.hostEndpointDirectory(command.endpointId, "data"));
+      // Only Docker needs the bind source to exist before the container starts. On Kubernetes
+      // the claim's subPath directories are created by the workload's init container, and the
+      // pod does not exist yet -- exec'ing here would abort the create before it began.
+      if (this.storage.kind === "local") await this.storage.for(name).ensureDirectory(dataMount);
       await onProgress({ phase: "creating-container", percent: 55, message: "Creating LLBot container" });
       const ports = llbotLoginPorts(command.endpointId);
       await docker.create({
@@ -250,10 +265,15 @@ export class LLBotRuntime {
           "botroost.generation": String(command.generation),
         },
         environment: { WEBUI_PORT: WEBUI_CONTAINER_PORT, TZ: "Asia/Shanghai", ...(proxyEnvironment ?? {}) },
-        mounts: [{ type: "bind", source: hostData, target: "/app/llbot/data" }],
+        mounts: [{ type: "bind", source: dataMount, target: "/app/llbot/data" }],
         hostConfig: { networkMode: this.networkMode, portBindings: {} },
         resources: desiredResources,
+        // Kubernetes has no host ports (ClusterIP only); the driver ignores this and exposes
+        // the WebUI through the workload's Service instead.
         publishedPorts: [{ hostPort: String(ports.webuiPort), containerPort: WEBUI_CONTAINER_PORT }],
+        // The provider talks to OneBot over the container network, so this port is never
+        // published on Docker -- but a Kubernetes Service only routes declared ports.
+        exposePorts: [ONEBOT_HTTP_PORT],
       });
     }
     if (command.action === "stop" && existing) { await onProgress({ phase: "stopping-container", percent: 70, message: "Stopping LLBot container" }); await docker.stop(name); }
@@ -318,14 +338,14 @@ export class LLBotRuntime {
     return undefined;
   }
   private async findOneBotConfig(endpointId: string): Promise<{ path: string; qq: string; config: JsonObject } | null> {
-    const directory = this.hostEndpointDirectory(endpointId, "data");
-    let entries: string[];
-    try { entries = await readdir(directory); } catch { return null; }
+    const directory = this.containerMounts.data ?? this.hostEndpointDirectory(endpointId, "data");
+    const entries = await this.storage.for(this.containerName(endpointId)).readdir(directory).catch(() => []);
+    if (!entries.length) return null;
     for (const entry of entries) {
       const match = /^config_(.+)\.json$/.exec(entry);
       if (!match?.[1]) continue;
       const path = join(directory, entry);
-      const config = asJsonObject(JSON.parse(await readFile(path, "utf8")) as JsonValue);
+      const config = asJsonObject(JSON.parse(await this.storage.for(this.containerName(endpointId)).readFile(path)) as JsonValue);
       return { path, qq: match[1], config };
     }
     return null;
@@ -373,9 +393,9 @@ export class LLBotRuntime {
     });
     return { ...config, ob11: { ...ob11, enable: true, connect: [...passthrough, ...mappedServers, ...mappedClients] } };
   }
-  private async writeOneBotWebsockets(path: string, config: JsonObject, clients: unknown[], servers: unknown[]) {
+  private async writeOneBotWebsockets(endpointId: string, path: string, config: JsonObject, clients: unknown[], servers: unknown[]) {
     const merged = this.mapOneBotWebsockets(config, clients, servers);
-    await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+    await this.storage.for(this.containerName(endpointId)).writeFile(path, `${JSON.stringify(merged, null, 2)}\n`);
   }
   /** Editor-shaped snapshot of the OneBot websocket configuration (NapCat field names so the
    *  console editor renders unchanged); only present once QQ login created config_<qq>.json. */
@@ -421,7 +441,9 @@ export class LLBotRuntime {
     const configuredToken = (this.options.onebotAccessToken ?? process.env.LLBOT_ONEBOT_ACCESS_TOKEN ?? "").trim() || undefined;
     const token = configuredToken ?? await this.readOneBotToken(command.endpointId);
     const ports = llbotLoginPorts(command.endpointId);
-    const loginGuide = { webuiPort: ports.webuiPort };
+    const webuiUrl = loginUrl(ports.webuiPort);
+    // See loginUrl(): on Kubernetes the browser needs an operator-provided entry point.
+    const loginGuide = { webuiPort: ports.webuiPort, ...(webuiUrl ? { webuiUrl } : {}) };
     const [statusSettled, loginSettled, versionSettled] = await Promise.allSettled([
       this.oneBotGet(base, "get_status", token),
       this.oneBotGet(base, "get_login_info", token),

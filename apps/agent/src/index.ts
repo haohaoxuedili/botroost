@@ -20,10 +20,18 @@ import { LLBotRuntime } from "./llbot-runtime.js";
 import type { RuntimeDriver, RuntimeSpec } from './runtime/types.js';
 import { resolveRuntimeBackend } from './runtime/config.js';
 import { KubernetesRuntimeDriver } from './runtime/kubernetes.js';
+import { KubernetesDockerClient } from './runtime/kubernetes-docker.js';
+import { LocalRuntimeStorage, PodRuntimeStorage } from './runtime/storage.js';
 import { inspectedResourceLimits, parseDockerStats, ResourceUsageSampler, RESOURCE_SAMPLE_TIMEOUT_MS, type DockerStatsReader, type ResourceLimits } from "./resource-usage.js";
 
 type JsonValue = null | boolean | number | string | JsonValue[] | JsonObject;
 type JsonObject = { [key: string]: JsonValue };
+
+// Paths the protocol container sees its durable volumes at. Docker hands the provider host
+// directories to bind-mount; Kubernetes mounts subPaths of the endpoint's claim here, so the
+// provider must address these paths instead of host directories.
+const snowlumaContainerMounts = () => ({ qq: "/app/.config", config: "/app/snowluma-data" });
+const llbotContainerMounts = () => ({ data: "/app/llbot/data" });
 /** Detects transient control-plane transport failures that should be retried via the command lease, not recorded as a failed outcome. */
 export function isTransientTransportError(error: unknown): boolean {
   const cause = (error as { cause?: unknown } | null)?.cause;
@@ -95,6 +103,9 @@ export interface DockerCreateInput {
   securityOpt?: string[];
   shmBytes?: number;
   publishedPorts?: { hostPort: string; containerPort: string }[];
+  /** Container ports the provider reaches over the container network but never publishes.
+   *  Docker needs no declaration for these; a Kubernetes Service does. */
+  exposePorts?: number[];
 }
 export interface DockerInspectResult {
   id: string;
@@ -111,7 +122,8 @@ export interface DockerClient {
   stats?: DockerStatsReader;
   inspect(name: string): Promise<DockerInspectResult | null>;
   create(input: DockerCreateInput): Promise<{ id: string }>;
-  remove(name: string): Promise<void>;
+  /** `discardData` is only set on explicit endpoint deletion; replacement keeps durable state. */
+  remove(name: string, options?: { discardData?: boolean }): Promise<void>;
   removeHostEndpoint(root: string, endpointId: string, image: string): Promise<void>;
   start(name: string): Promise<void>;
   stop(name: string): Promise<void>;
@@ -1210,35 +1222,64 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
   // for enrollment and the runtime prewarmed at startup (so heartbeat observations begin
   // immediately, matching the previous single-runtime behavior).
   const backend = resolveRuntimeBackend(process.env.AGENT_RUNTIME);
+  // SnowLuma and LLBot are written against the Docker API surface. On Kubernetes the same
+  // surface is served by KubernetesDockerClient, which composes a KubernetesRuntimeDriver so
+  // workload lifecycle, convergence and template idempotency stay in one implementation.
+  // Their endpoint data lives on a PVC the agent pod cannot mount, so file access is routed
+  // through pods/exec (PodRuntimeStorage) at the paths the protocol container sees.
+  const agentNamespace = process.env.AGENT_NAMESPACE?.trim()
+    || (process.env.POD_NAMESPACE ?? "").trim()
+    || undefined;
+  let kubernetesProfile: ConstructorParameters<typeof KubernetesRuntimeDriver>[0] | undefined;
+  const kubernetesProfileFor = () => {
+    kubernetesProfile ??= {
+      namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(),
+      volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi",
+      // The namespace this agent pod runs in; runtime Services are fenced to it so other
+      // cluster workloads cannot reach an endpoint's UI or remote-desktop ports.
+      ...(agentNamespace ? { agentNamespace } : {}),
+      ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}),
+    };
+    return kubernetesProfile;
+  };
   const runtimeFactory = async (target: string): Promise<AgentRuntime | null> => {
     if (target === "napcat") return new NapCatRuntime({
       stateDirectory: join(nodeStateDir, "napcat"),
-      ...(backend === "kubernetes" ? { driver: new KubernetesRuntimeDriver({ namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(), volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi", ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}) }, signal) } : {}),
+      ...(backend === "kubernetes" ? { driver: new KubernetesRuntimeDriver(kubernetesProfileFor(), signal) } : {}),
       hostStateDirectory: join(process.env.NAPCAT_HOST_STATE_DIR ?? nodeStateDir, "napcat"),
       ...(signal === undefined ? {} : { signal }),
       ...(process.env.NAPCAT_TOKEN === undefined ? {} : { napcatToken: process.env.NAPCAT_TOKEN }),
     });
     if (target === "snowluma") {
-      // SnowLuma drives containers through the Docker API surface (exec, published
-      // ports, host bind mounts); there is no Kubernetes-backed DockerClient yet.
-      if (backend === "kubernetes") throw new Error("SnowLuma runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      const kube = backend === "kubernetes";
+      const docker = kube
+        ? new KubernetesDockerClient(new KubernetesRuntimeDriver(kubernetesProfileFor(), signal), kubernetesProfileFor(), signal)
+        : new DockerCliClient();
       return new SnowLumaRuntime({
-        docker: new DockerCliClient(),
+        docker,
         stateDirectory: join(nodeStateDir, "snowluma"),
-        hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma"),
+        // Docker: host bind-mount sources. Kubernetes: paths inside the endpoint pod, which
+        // is where the protocol container mounts the claim.
+        ...(kube ? { containerMounts: snowlumaContainerMounts() } : { hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma") }),
+        storage: kube ? new PodRuntimeStorage(docker) : new LocalRuntimeStorage(),
         ...(signal === undefined ? {} : { signal }),
         ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),
       });
     }
     if (target === "llbot") {
-      if (backend === "kubernetes") throw new Error("LLBot runtime requires the docker runtime backend; AGENT_RUNTIME=kubernetes is not supported");
+      const kube = backend === "kubernetes";
+      const docker = kube
+        ? new KubernetesDockerClient(new KubernetesRuntimeDriver(kubernetesProfileFor(), signal), kubernetesProfileFor(), signal)
+        : new DockerCliClient();
       return new LLBotRuntime({
-        docker: new DockerCliClient(),
+        docker,
         stateDirectory: join(nodeStateDir, "llbot"),
-        hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot"),
+        ...(kube ? { containerMounts: llbotContainerMounts() } : { hostStateDirectory: join(process.env.LLBOT_HOST_STATE_DIR ?? nodeStateDir, "llbot") }),
+        storage: kube ? new PodRuntimeStorage(docker) : new LocalRuntimeStorage(),
         ...(signal === undefined ? {} : { signal }),
         ...(process.env.LLBOT_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.LLBOT_ONEBOT_ACCESS_TOKEN }),
-        ...(process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
+        // Docker-only: Kubernetes services are never host-networked.
+        ...(kube || process.env.LLBOT_DOCKER_NETWORK === undefined ? {} : { networkMode: process.env.LLBOT_DOCKER_NETWORK }),
       });
     }
     if (target === "fake") return FakeRuntime.open(join(nodeStateDir,"runtime-effects.json"));

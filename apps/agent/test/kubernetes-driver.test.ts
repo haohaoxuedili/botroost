@@ -23,9 +23,32 @@ describe('Kubernetes API lifecycle safety', () => {
       await new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi' }, undefined, config).restart('test', 'op');
       expect(remove).toHaveBeenCalledOnce();
       for (const call of patch.mock.calls) expect(call[4]).toBeUndefined();
-      expect(remove.mock.calls[0]?.[6]).toEqual({ preconditions: { uid: 'original', resourceVersion: '2' } });
+      // The uid keeps a replacement pod from being deleted by a stale call; the resourceVersion
+      // only added conflicts, because a running pod's version moves with every status update.
+      expect(remove.mock.calls[0]?.[6]).toEqual({ preconditions: { uid: 'original' } });
     } finally { read.mockRestore(); patch.mockRestore(); remove.mockRestore(); }
   }, 2000);
+  it('retries a patch that loses the resourceVersion race instead of failing the operation', async () => {
+    const { config, workload, labels } = fixture();
+    // The pod already carries the marker, so restart() has nothing left to do once the
+    // template write succeeds -- the assertion is about the patch, not the rollout.
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockImplementation(async object => object.kind === 'StatefulSet'
+      ? workload
+      : { apiVersion: 'v1', kind: 'Pod', metadata: { name: 'test-0', uid: 'original', resourceVersion: '2', labels, annotations: { 'botroost.io/restart-operation': 'op' } }, status: { containerStatuses: [{ name: 'protocol', state: { running: {} } }] } });
+    // The control loop and the kubelet both write the same StatefulSet, so the first two
+    // attempts carry a version that is already stale.
+    const conflict = Object.assign(new Error('the object has been modified'), { code: 409 });
+    const patch = vi.spyOn(KubernetesObjectApi.prototype, 'patch')
+      .mockRejectedValueOnce(conflict)
+      .mockRejectedValueOnce(conflict)
+      .mockResolvedValue(workload);
+    try {
+      await new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi' }, undefined, config).restart('test', 'op');
+      // Two conflicts, then success: the operation continues instead of surfacing the 409.
+      // The following scale() patch from start() is a separate write with its own retries.
+      expect(patch.mock.calls.length).toBeGreaterThanOrEqual(3);
+    } finally { read.mockRestore(); patch.mockRestore(); }
+  }, 5000);
   it('restores the previous resource request when the larger replacement cannot be scheduled', async () => {
     const { config, labels } = fixture();
     const small = { requests: { cpu: '1', memory: '1Gi' }, limits: { cpu: '1', memory: '1Gi' } };

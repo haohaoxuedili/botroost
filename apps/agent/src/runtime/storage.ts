@@ -30,7 +30,7 @@ export class LocalRuntimeStorage implements RuntimeStorage {
   readonly kind = 'local' as const;
   /** The host filesystem is shared with the containers, so every workload sees the same
    *  absolute paths; the scope is a no-op. */
-  for(_workload: string): EndpointStorage { return local; }
+  for(): EndpointStorage { return local; }
 }
 
 const local: EndpointStorage = {

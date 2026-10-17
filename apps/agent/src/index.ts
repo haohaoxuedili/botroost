@@ -113,6 +113,9 @@ export interface DockerInspectResult {
   image: string;
   state: "created" | "running" | "exited" | "unknown";
   ipAddress: string | null;
+  /** Cluster Service name, when the backend has one. Providers report it so the console can
+   *  reach the runtime's UI ports without publishing them. */
+  serviceHost?: string | null;
   labels: Record<string, string>;
   resources?: { cpuMillis: number; memoryMiB: number; memorySwapMiB: number };
   resourceLimits?: ResourceLimits;
@@ -1227,6 +1230,14 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
   // workload lifecycle, convergence and template idempotency stay in one implementation.
   // Their endpoint data lives on a PVC the agent pod cannot mount, so file access is routed
   // through pods/exec (PodRuntimeStorage) at the paths the protocol container sees.
+/** Namespaces allowed to reach a runtime's UI ports besides the agent's own: the console API
+ *  proxies every login screen, so it must not be fenced out. RUNTIME_CONSOLE_NAMESPACES is a
+ *  comma-separated list; it defaults to the agent's namespace, which is where the API runs in
+ *  the single-namespace deployment. */
+const consoleNamespaces = () => (process.env.RUNTIME_CONSOLE_NAMESPACES ?? "")
+  .split(",")
+  .map(namespace => namespace.trim())
+  .filter(namespace => namespace.length > 0);
   const agentNamespace = process.env.AGENT_NAMESPACE?.trim()
     || (process.env.POD_NAMESPACE ?? "").trim()
     || undefined;
@@ -1238,6 +1249,9 @@ export async function startAgentFromEnv(signal?:AbortSignal): Promise<DurableFak
       // The namespace this agent pod runs in; runtime Services are fenced to it so other
       // cluster workloads cannot reach an endpoint's UI or remote-desktop ports.
       ...(agentNamespace ? { agentNamespace } : {}),
+      // The console API proxies each endpoint's UI, so its namespace has to be let through the
+      // runtime's NetworkPolicy: on a split deployment it does not share the agent's namespace.
+      ...(consoleNamespaces().length ? { consoleNamespaces: consoleNamespaces() } : {}),
       ...(process.env.RUNTIME_STORAGE_CLASS ? { storageClass: process.env.RUNTIME_STORAGE_CLASS } : {}),
     };
     return kubernetesProfile;

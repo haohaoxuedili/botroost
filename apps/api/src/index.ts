@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { z, ZodError } from "zod";
 import { AuthService, can, requireSameOriginAndCsrf } from "@botroost/auth";
 import { DatabaseError, digest, PostgresDatabase } from "@botroost/database";
+import { registerRuntimeProxy, runtimeDialHost } from "./runtime-proxy.js";
 import { AgentEnrollmentRequestSchema, AgentHeartbeatRequestSchema, ClaimCommandRequestSchema, CommandProgressRequestSchema, CommandReceiptRequestSchema, CommandResultRequestSchema, proxyConfigurationSchema } from "@botroost/agent-protocol";
 import { LoginAttemptLimiter } from "./security-policy.js";
 
@@ -36,6 +37,30 @@ const providers = [
 ] as const;
 
 type Permission = "read" | "operate" | "manage-members" | "manage-nodes";
+
+/** The console's own mount for a runtime's UI. Only a *resolved path* may match this: a
+ *  mutating API request must not earn the proxy's CSRF exemption through its query string. */
+const RUNTIME_MOUNT = /^\/api\/v1\/endpoints\/[^/]+\/runtime\/\d+(?:\/|$)/;
+
+/** What the agent observed about an endpoint's runtime UI, as stored in its snapshot. */
+interface RuntimeLoginGuide {
+  /** Ports the operator's browser uses. */
+  webuiPort?: number;
+  novncPort?: number;
+  /** Ports the console must dial: a Service routes the container's port, not the host port. */
+  webuiDialPort?: number;
+  novncDialPort?: number;
+  /** Cluster-internal address of the runtime's Service. */
+  webuiHost?: string;
+  /** Operator-supplied entry point (RUNTIME_LOGIN_BASE_URL), for split deployments. */
+  webuiUrl?: string;
+  novncUrl?: string;
+}
+
+/** A port the agent reported, or null: never a value the caller supplied. */
+function reportedPort(value: number | undefined) {
+  return Number.isInteger(value) && value! > 0 && value! <= 65535 ? value : null;
+}
 export interface ApiOptions { database?: PostgresDatabase; databaseUrl?: string; credentialKey?: Buffer; trustProxy?: FastifyServerOptions["trustProxy"]; publicOrigin?: string }
 const page=<T>(items:T[])=>({items,page:1,pageSize:25,total:items.length});
 const rolePermissions:Record<string,string[]>={viewer:["endpoint:read","node:read","provider:read","operation:read","audit:read","workspace:read"],operator:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","provider:read","operation:read","audit:read","workspace:read"],admin:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","node:create","node:delete","provider:read","operation:read","audit:read","workspace:read","member:read","member:manage","settings:read","settings:manage"],owner:["endpoint:read","endpoint:create","endpoint:update","endpoint:delete","endpoint:start","endpoint:stop","endpoint:restart","node:read","node:create","node:delete","provider:read","operation:read","audit:read","workspace:read","member:read","member:manage","settings:read","settings:manage"]};
@@ -89,13 +114,67 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
     return result;
   }
   api.addHook("preHandler", async request => {
-    const publicRoutes=["/api/v1/auth/login","/api/v1/auth/register","/api/v1/auth/invitations/accept"];if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(request.url) || request.url.startsWith("/api/v1/agent/")) return;
+    const publicRoutes=["/api/v1/auth/login","/api/v1/auth/register","/api/v1/auth/invitations/accept"];
+    // The runtime proxy forwards to an endpoint's own UI, not to this API: it carries its own
+    // same-origin guard (a custom header on mutating methods) and must not require this API's
+    // CSRF token, which the proxied page never has.
+    // Only the resolved path may grant the exemption: a mutating API request whose query
+    // string happens to contain "/runtime/" must still face the origin and CSRF checks.
+    const path = request.url.split("?")[0] ?? request.url;
+    if (RUNTIME_MOUNT.test(path)) return;
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method) || publicRoutes.includes(path) || path.startsWith("/api/v1/agent/")) return;
     const current = await principal(request);
     try {
       requireSameOriginAndCsrf({ method: request.method, host:origin.host, ...(request.headers.origin ? { origin: request.headers.origin } : {}), ...(request.cookies.botroost_csrf ? { csrfCookie: request.cookies.botroost_csrf } : {}), ...(request.headers["x-csrf-token"] ? { csrfHeader: String(request.headers["x-csrf-token"]) } : {}), expectedCsrfHash: current.csrfHash });
     } catch { throw fail("csrf rejected", 403); }
   });
 
+  // Runtime UI through the console: see registerRuntimeProxy. Registered before the API
+  // routes so its wildcard prefix owns /runtime/... and never collides with them.
+  registerRuntimeProxy(api, {
+    async authorize(request, endpointId) {
+      // Operating a runtime UI is an operation, not a read: a viewer must not reach noVNC.
+      const current = await authorize(request, "operate");
+      // An endpoint outside the caller's workspace must look non-existent, not forbidden.
+      const endpoint = await db.endpoint(current.workspaceId, endpointId);
+      if (!endpoint) throw new DatabaseError("not_found");
+      return { workspaceId: current.workspaceId };
+    },
+    async route(workspaceId, endpointId, port) {
+      const endpoint = await db.endpoint(workspaceId, endpointId);
+      if (!endpoint) return null;
+      const provider = endpoint.providerId;
+      if (provider !== "snowluma" && provider !== "llbot") return null;
+      // A snapshot failure is the console's problem, not the runtime's: let it propagate so
+      // the proxy answers "unavailable" instead of "runtime unreachable".
+      const snapshot = provider === "snowluma"
+        ? await db.endpointSnowlumaSnapshot(workspaceId, endpointId)
+        : await db.endpointLLBotSnapshot(workspaceId, endpointId);
+      const guide = (snapshot?.metadata as { loginGuide?: RuntimeLoginGuide } | null)?.loginGuide;
+      if (!guide) return null;
+      // The console asks with a published port; only the ones the agent reported are answered,
+      // and each maps to the port the console must actually dial (a Service routes the
+      // container's port, Docker publishes the host port) and to the operator's entry URL.
+      const candidates = [
+        { published: guide.webuiPort, dial: guide.webuiDialPort, url: guide.webuiUrl },
+        { published: guide.novncPort, dial: guide.novncDialPort, url: guide.novncUrl },
+      ].filter(candidate => candidate.published === port);
+      const match = candidates[0];
+      if (!match) return null;
+      // An operator-provided entry point is the only address that survives a split deployment,
+      // where the API cannot route to the cluster's Service network.
+      const entry = match.url ? new URL(match.url) : null;
+      if (entry && entry.protocol === "https:" && entry.hostname) {
+        return { host: entry.hostname, port: Number(entry.port || 443), scheme: "https" as const, query: entry.search || null };
+      }
+      // Otherwise dial the address the agent reported, which must be a cluster-local one: the
+      // agent's heartbeat is not a licence to point the console at an arbitrary destination.
+      const host = runtimeDialHost(guide.webuiHost);
+      const dial = reportedPort(match.dial) ?? reportedPort(match.published);
+      if (!host || !dial) return null;
+      return { host, port: dial };
+    },
+  });
   api.get("/health", async () => ({ status: "ok" }));
   api.get("/ready", async (_request, reply) => { try { await db.ping();if(!await db.migrationsReady())throw new Error("schema ledger unavailable"); return { status: "ready" }; } catch { return reply.code(503).send({ error: { code: "not_ready", message: "database or schema unavailable" } }); } });
   api.get("/api/v1/platform/settings",async request=>{const current=await principal(request);if(!await db.isPlatformOwner(current.userId))throw fail("platform owner required",403);return db.platformSettings()});
@@ -169,7 +248,13 @@ export function buildApi(options: ApiOptions = {}): FastifyInstance {
   api.post("/api/v1/agent/commands/:id/progress", async (request, reply) => { const node = await agentNode(request); await db.recordAgentProgress(node.id, idParams.parse(request.params).id, CommandProgressRequestSchema.parse(request.body)); return reply.code(202).send({ accepted: true }); });
   api.post("/api/v1/agent/commands/:id/result", async (request, reply) => { const node = await agentNode(request); await db.recordAgentResult(node.id, idParams.parse(request.params).id, CommandResultRequestSchema.parse(request.body)); return reply.code(202).send({ accepted: true }); });
   api.get("/api/v1/endpoints", async request => page(await db.endpoints((await principal(request)).workspaceId)));
-  api.post("/api/v1/endpoints", async (request, reply) => { const current = await authorize(request, "operate"); const body = endpointInput.parse(request.body); if (!["fake","napcat","snowluma","llbot"].includes(body.providerId)) throw fail("provider unavailable", 409); if((body.providerId==="napcat"||body.providerId==="snowluma"||body.providerId==="llbot")&&!body.nodeId)throw fail(`${body.providerId === "snowluma" ? "SnowLuma" : "NapCat"} endpoints require an outbound node`,409); return reply.code(201).send(await db.createEndpoint(current.workspaceId, body.name, body.providerId, body.nodeId)); });
+  api.post("/api/v1/endpoints", async (request, reply) => { const current = await authorize(request, "operate"); const body = endpointInput.parse(request.body); if (!["fake","napcat","snowluma","llbot"].includes(body.providerId)) throw fail("provider unavailable", 409); if((body.providerId==="napcat"||body.providerId==="snowluma"||body.providerId==="llbot")&&!body.nodeId)throw fail(`${body.providerId === "snowluma" ? "SnowLuma" : "NapCat"} endpoints require an outbound node`,409);
+    // An endpoint may only land on a node that can serve it: either the node enrolled for that
+    // provider, or an agent that reported provider routing (a legacy agent would fail every
+    // command instead, long after the operator thought the endpoint was created).
+    const node = body.nodeId ? await db.nodeProvider(current.workspaceId, body.nodeId) : null;
+    if (node && node.provider !== body.providerId && node.providerRouting !== true) throw fail(`this node serves ${node.provider} endpoints only; upgrade its agent for cross-provider routing`, 409);
+    return reply.code(201).send(await db.createEndpoint(current.workspaceId, body.name, body.providerId, body.nodeId)); });
   api.get("/api/v1/endpoints/:id", async (request, reply) => { const current = await principal(request); const result = await db.endpoint(current.workspaceId, idParams.parse(request.params).id); return result ?? reply.code(404).send({ error: { code: "not_found", message: "not found" } }); });
   api.put("/api/v1/endpoints/:id/proxy", async (request, reply) => { const current = await authorize(request, "operate"); const endpointId = idParams.parse(request.params).id; const body = z.object({ proxy: proxyConfigurationSchema.nullable() }).parse(request.body); const endpoint = await db.endpoint(current.workspaceId, endpointId); if (!endpoint) throw fail("not found", 404); const idempotencyKey = z.string().min(1).max(200).parse(request.headers["idempotency-key"]); const result = await db.mutateEndpoint({ workspaceId: current.workspaceId, endpointId, actorUserId: current.userId, action: "update-endpoint-proxy", expectedGeneration: endpoint.generation, idempotencyKey, metadata: { proxy: body.proxy } }); return reply.code(202).send(result.operation); });
   api.get("/api/v1/endpoints/:id/napcat/login-qrcode", async (request, reply) => { const current = await authorize(request, "operate"); const metadata = await db.endpointNapcatMetadata(current.workspaceId, idParams.parse(request.params).id); const login = metadata.login as Record<string, unknown>|undefined; const qrcode = typeof login?.qrcode === "string" ? login.qrcode : null; return qrcode ? { qrcode } : reply.code(404).send({ error: { code: "not_found", message: "QR login is not available" } }); });

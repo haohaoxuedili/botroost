@@ -1,6 +1,7 @@
 import type { RuntimeSpec } from './types.js';
 export interface KubernetesProfile { namespace: string; storageClass?: string; volumeSize: string; nodeSelector?: Record<string,string>; /** Namespace the agent runs in. When set, each runtime Service is fenced off so only the
-   *  agent can reach the provider's management/UI ports. */ agentNamespace?: string }
+   *  agent can reach the provider's management/UI ports. */ agentNamespace?: string; /** Extra namespaces allowed to reach the UI ports, e.g. the console API's own namespace: it
+   *  proxies the runtime UI, so fencing it out would break every login screen. */ consoleNamespaces?: string[] }
 export function kubernetesResources(input: RuntimeSpec, profile: KubernetesProfile) {
   for (const name of [input.name, profile.namespace]) if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) || name.length > 63) throw new Error('Invalid Kubernetes resource name');
   const metadata = { name: input.name, namespace: profile.namespace, labels: input.labels };
@@ -31,7 +32,14 @@ export function kubernetesResources(input: RuntimeSpec, profile: KubernetesProfi
     spec: {
       podSelector: { matchLabels: workloadLabels },
       policyTypes: ['Ingress'],
-      ingress: [{ from: [{ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': profile.agentNamespace } } }], ports: ports.map(port => ({ protocol: 'TCP', port: port.port })) }],
+      // The console API dials the UI ports through this proxy, and it usually runs in a
+      // namespace of its own: both its namespace and the agent's are allowed, nothing else.
+      ingress: [{
+        from: [profile.agentNamespace, ...(profile.consoleNamespaces ?? [])]
+          .filter((namespace, index, all) => namespace && all.indexOf(namespace) === index)
+          .map(namespace => ({ namespaceSelector: { matchLabels: { 'kubernetes.io/metadata.name': namespace } } })),
+        ports: ports.map(port => ({ protocol: 'TCP', port: port.port })),
+      }],
     },
   } : null;
   const resources = { requests: { cpu: `${input.resources.cpuMillis}m`, memory: `${input.resources.memoryMiB}Mi` }, limits: { cpu: `${input.resources.cpuMillis}m`, memory: `${input.resources.memoryMiB}Mi` } };

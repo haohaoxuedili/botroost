@@ -33,9 +33,9 @@ type TrafficEvent={at:string;direction:'inbound'|'outbound';scope:'group'|'priva
 type ConnectionEvent={at:string;transport:'websocket-client'|'websocket-server';status:'listening'|'connected'|'disconnected'|'reconnecting'|'error'};
 type ProtocolTraffic={status:'ok'|'partial'|'unavailable';complete?:boolean;source:string;privacy:'aggregate_only';observedAt:string;sampleIntervalSeconds:number;oneMinute:TrafficWindow;fiveMinutes:TrafficWindow;buckets:{startedAt:string;inbound:number;outbound:number;total:number}[];recent:TrafficEvent[];recentConnections:ConnectionEvent[];error?:string};
 type NapCatStatus={qq:null|Record<string,unknown>;onebot:null|{status?:Record<string,unknown>;loginInfo?:Record<string,unknown>;version?:Record<string,unknown>;probes?:Record<string,OneBotProbe>;directory?:{friends:OneBotDirectoryCollection;groups:OneBotDirectoryCollection};config?:{websocketClients?:WsClient[];websocketServers?:WsServer[]}};traffic?:ProtocolTraffic;freshness?:TrafficFreshness};
-type LLBotLoginGuide={webuiPort?:number};
+type LLBotLoginGuide={webuiPort?:number;webuiHost?:string};
 type LLBotStatus={qq:null|Record<string,unknown>;login:null|Record<string,unknown>;onebot:NapCatStatus['onebot'];traffic?:ProtocolTraffic|null;loginGuide?:null|LLBotLoginGuide;freshness?:TrafficFreshness};
-type SnowlumaLoginGuide={novncPort?:number;webuiPort?:number;webuiUsername?:string;webuiPassword?:string};
+type SnowlumaLoginGuide={novncPort?:number;webuiPort?:number;webuiHost?:string;webuiUsername?:string;webuiPassword?:string};
 type SnowlumaStatus={qq:null|Record<string,unknown>;login:null|Record<string,unknown>;onebot:NapCatStatus['onebot'];traffic?:ProtocolTraffic|null;loginGuide?:null|SnowlumaLoginGuide;freshness?:TrafficFreshness};
 const titleCase=(value:string)=>value.charAt(0).toUpperCase()+value.slice(1).replaceAll('-',' ');
 const eventTime=(value:string,locale:string)=>new Date(value).toLocaleTimeString(locale,{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false});
@@ -209,6 +209,16 @@ export function EndpointDetail({session,id}:{session:Session;id:string}){
   </Stack>;
 }
 
+// Where the browser should load a runtime's UI from.
+//
+// Docker publishes the UI ports on the console host, so the browser can dial them directly.
+// Kubernetes only exposes ClusterIP Services, which no browser can reach, so the agent reports
+// the Service host and the console proxies those ports through its own origin. Operators then
+// never need a second hostname, a published port, or a port-forward: every login screen is a
+// panel route.
+const runtimeUiBase=(endpointId:string,port:number,proxied:boolean)=>
+  proxied?`/api/v1/endpoints/${endpointId}/runtime/${port}`:`http://${window.location.hostname}:${port}`;
+
 // Deterministic per-endpoint WebUI port; must match llbotLoginPorts in apps/agent.
 const llbotWebuiPortFallback=(endpointId:string)=>({webuiPort:3080+Number.parseInt(endpointId.slice(0,4),16)%400});
 function LLBotLoginPanel({endpointId,guide}:{endpointId:string;guide?:LLBotLoginGuide|null}){
@@ -216,7 +226,7 @@ function LLBotLoginPanel({endpointId,guide}:{endpointId:string;guide?:LLBotLogin
   const[expanded,setExpanded]=useState(false);
   const fallback=llbotWebuiPortFallback(endpointId);
   const webuiPort=guide?.webuiPort??fallback.webuiPort;
-  const webuiUrl=`http://${window.location.hostname}:${webuiPort}/`;
+  const webuiUrl=`${runtimeUiBase(endpointId,webuiPort,Boolean(guide?.webuiHost))}/`;
   useEffect(()=>{
     if(!expanded)return;
     const previous=document.body.style.overflow;
@@ -249,9 +259,10 @@ function SnowlumaLoginPanel({endpointId,guide}:{endpointId:string;guide?:Snowlum
   const[expanded,setExpanded]=useState(false);
   const fallback=snowlumaLoginPortFallback(endpointId);
   const novncPort=guide?.novncPort??fallback.novncPort;
-  // Reach the noVNC port on the same host that serves the console; never echo the
-  // raw host:port around the UI.
-  const novncUrl=`http://${window.location.hostname}:${novncPort}/vnc.html?autoconnect=1&resize=scale&password=vncpasswd`;
+  // Reach noVNC through the console: either the published port on the console host, or the
+  // API's proxy when the runtime only has a ClusterIP. noVNC derives its websocket from the
+  // page path, so it follows the proxy prefix without extra configuration.
+  const novncUrl=`${runtimeUiBase(endpointId,novncPort,Boolean(guide?.webuiHost))}/vnc.html?autoconnect=1&resize=scale&password=vncpasswd`;
   // Lock page scrolling while the expanded view is open so the wheel/keyboard
   // only reaches the remote desktop, and close it with Escape.
   useEffect(()=>{

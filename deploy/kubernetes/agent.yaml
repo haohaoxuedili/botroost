@@ -25,6 +25,8 @@ rules:
     verbs: [get, create, patch, delete]
   # Without this the agent cannot create an endpoint's ingress policy, and cannot read it back
   # while cleaning up a deletion: the cluster answers 403 Forbidden.
+  # Per-namespace rule: every namespace an agent serves needs it, and production also runs
+  # endpoints in botroost-runtime-hk, whose Role must be patched alongside this manifest.
   - apiGroups: ['networking.k8s.io']
     resources: [networkpolicies]
     verbs: [get, create, patch, delete]

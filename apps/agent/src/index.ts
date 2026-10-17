@@ -783,7 +783,10 @@ export class NapCatRuntime {
   private async webCredential(endpointId: string, base: URL) {
     const cached=this.webCredentials.get(endpointId);
     if(cached)return cached;
-    const loginToken=(this.options.napcatToken??process.env.NAPCAT_TOKEN??"").trim();
+    // The token is hashed exactly as the container received it: NapCat writes it verbatim into
+    // webui.json, so a trailing newline in the secret is part of the token. Trimming it here
+    // produced a different hash and every login was answered with "token is invalid".
+    const loginToken=this.options.napcatToken??process.env.NAPCAT_TOKEN??"";
     const hashed=createHash("sha256").update(`${loginToken}.napcat`).digest("hex");
     const auth=await this.fetcher(new URL("/api/auth/login",base),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({hash:hashed}),signal:this.requestSignal(10_000)});
     if(!auth.ok)throw new Error(`NapCat auth failed: ${auth.status}`);

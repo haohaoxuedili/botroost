@@ -12,9 +12,11 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   private objects: KubernetesObjectApi;
   private core: CoreV1Api;
   private metricsApi?: Metrics;
+  private kc: KubeConfig;
   constructor(private profile: KubernetesProfile, private signal?: AbortSignal, config?: KubeConfig) {
     const kc = config ?? new KubeConfig();
     if (!config) kc.loadFromCluster();
+    this.kc = kc;
     this.objects = KubernetesObjectApi.makeApiClient(kc);
     this.core = kc.makeApiClient(CoreV1Api);
     this.metricsApi = new Metrics(kc);

@@ -11,6 +11,7 @@ import {
   type RuntimeCommand,
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseSnowlumaConnectionLine, parseSnowlumaTrafficLine } from "./traffic.js";
+import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
 import type {
   AgentCommandTransport,
   DockerClient,
@@ -111,13 +112,21 @@ export class SnowLumaRuntime {
     fetcher?: FetchLike;
     signal?: AbortSignal;
     operationTimeoutMs?: number;
+    /** Reaches the endpoint's durable data. Defaults to the agent host (Docker backend). */
+    storage?: RuntimeStorage;
+    /** Kubernetes backend: the in-container mount target for each volume name. */
+    containerMounts?: Record<string, string>;
   }) {
     this.networkMode = options.networkMode ?? process.env.SNOWLUMA_DOCKER_NETWORK ?? "bridge";
     this.containerPrefix = options.containerPrefix ?? "botroost-snowluma";
     if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(this.networkMode) || this.networkMode === "host" || this.networkMode.startsWith("container:")) throw new Error("SnowLuma docker network is invalid");
     if (!containerPrefixPattern.test(this.containerPrefix)) throw new Error("container prefix is invalid");
     this.fetcher = options.fetcher ?? globalThis.fetch;
+    this.storage = options.storage ?? new LocalRuntimeStorage();
+    this.containerMounts = options.containerMounts ?? {};
   }
+  private readonly storage: RuntimeStorage;
+  private readonly containerMounts: Record<string, string>;
   private commandStatePath() { return join(this.options.stateDirectory, "runtime-commands.json"); }
   private async loadCommands() {
     if (this.commandsLoaded) return;
@@ -226,7 +235,7 @@ export class SnowLumaRuntime {
       }
       if (appliedVia === "file") {
         await onProgress({ phase: "applying-configuration", percent: 70, message: "Writing OneBot WebSocket configuration" });
-        await this.writeOneBotWebsockets(found.path, found.config, clients, servers);
+        await this.writeOneBotWebsockets(command.endpointId, found.path, found.config, clients, servers);
         await onProgress({ phase: "applying-configuration", percent: 80, message: "Reloading the SnowLuma OneBot service" });
         // Restart only the OneBot service process; QQ keeps running so the login session survives.
         await docker.exec(name, ["supervisorctl", "restart", "snowluma"]);
@@ -253,22 +262,28 @@ export class SnowLumaRuntime {
     if (command.action !== "stop" && (!existing || existing.image !== SNOWLUMA_IMAGE || resourceDrift || proxyDrift)) {
       if (existing) { await onProgress({ phase: "preparing-runtime", percent: 35, message: "Replacing outdated SnowLuma container" }); await docker.remove(name); }
       await onProgress({ phase: "preparing-runtime", percent: 40, message: "Preparing runtime image and storage" });
-      const hostQq = this.hostEndpointDirectory(command.endpointId, "qq");
-      const hostConfig = this.hostEndpointDirectory(command.endpointId, "config");
-      await mkdir(hostQq, { recursive: true, mode: 0o777 });
+      // On Docker these are host directories handed to the container as bind mounts; on
+      // Kubernetes they are the in-container mount targets of the endpoint's PVC.
+      const hostQq = this.containerMounts.qq ?? this.hostEndpointDirectory(command.endpointId, "qq");
+      const hostConfig = this.containerMounts.config ?? this.hostEndpointDirectory(command.endpointId, "config");
+      const storage = this.storage.for(name);
+      await storage.ensureDirectory(hostQq);
       await onProgress({ phase: "preparing-runtime", percent: 45, message: "Preparing SnowLuma configuration storage" });
-      await mkdir(join(hostConfig, "config"), { recursive: true, mode: 0o777 });
+      await storage.ensureDirectory(join(hostConfig, "config"));
       // The SnowLuma image runs its main process as an unprivileged user (uid SNOWLUMA_UID,
       // default 1000) with cwd /app/snowluma-data, while its entrypoint writes config/runtime.json
       // as root. Bind-mount host directories world-writable and pre-seed runtime.json with mode
       // 0o666 so the entrypoint's root-owned overwrite keeps it writable by the main process.
-      await chmod(hostQq, 0o777).catch(() => {});
-      await chmod(hostConfig, 0o777).catch(() => {});
-      await chmod(join(hostConfig, "config"), 0o777).catch(() => {});
+      if (this.storage.kind === "local") {
+        await chmod(hostQq, 0o777).catch(() => {});
+        await chmod(hostConfig, 0o777).catch(() => {});
+        await chmod(join(hostConfig, "config"), 0o777).catch(() => {});
+      }
       const runtimeConfigPath = join(hostConfig, "config", "runtime.json");
       try {
-        await writeFile(runtimeConfigPath, `${JSON.stringify({ webuiPort: WEBUI_CONTAINER_PORT }, null, 2)}\n`, { flag: "a+" , mode: 0o666 });
-        await chmod(runtimeConfigPath, 0o666).catch(() => {});
+        // Never clobber an existing runtime.json: only seed it when absent.
+        const existing = await storage.readFile(runtimeConfigPath).catch(() => null);
+        if (existing === null) await storage.writeFile(runtimeConfigPath, `${JSON.stringify({ webuiPort: WEBUI_CONTAINER_PORT }, null, 2)}\n`);
       } catch { /* pre-seeding runtime.json is best-effort; the container entrypoint recreates it */ }
       await onProgress({ phase: "creating-container", percent: 55, message: "Creating SnowLuma container" });
       const ports = snowlumaLoginPorts(command.endpointId);
@@ -398,13 +413,13 @@ export class SnowLumaRuntime {
   private async findOneBotConfig(endpointId: string): Promise<{ path: string; qq: string; config: JsonObject } | null> {
     // The config directory is bind-mounted at /app/snowluma-data and SnowLuma keeps its
     // files under a "config" subdirectory, so scan both locations.
-    const mountDirectory = this.hostEndpointDirectory(endpointId, "config");
+    const mountDirectory = this.containerMounts.config ?? this.hostEndpointDirectory(endpointId, "config");
     for (const directory of [join(mountDirectory, "config"), mountDirectory]) {
-      for (const entry of await readdir(directory)) {
+      for (const entry of await this.storage.for(this.containerName(endpointId)).readdir(directory)) {
         const match = /^onebot_(.+)\.json$/.exec(entry);
         if (!match?.[1]) continue;
         const path = join(directory, entry);
-        const config = asJsonObject(JSON.parse(await readFile(path, "utf8")) as JsonValue);
+        const config = asJsonObject(JSON.parse(await this.storage.for(this.containerName(endpointId)).readFile(path)) as JsonValue);
         return { path, qq: match[1], config };
       }
     }
@@ -449,9 +464,9 @@ export class SnowLumaRuntime {
     });
     return { ...config, networks: { ...networks, wsServers: mappedServers, wsClients: mappedClients } };
   }
-  private async writeOneBotWebsockets(path: string, config: JsonObject, clients: unknown[], servers: unknown[]) {
+  private async writeOneBotWebsockets(endpointId: string, path: string, config: JsonObject, clients: unknown[], servers: unknown[]) {
     const merged = this.mapOneBotWebsockets(config, clients, servers);
-    await writeFile(path, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
+    await this.storage.for(this.containerName(endpointId)).writeFile(path, `${JSON.stringify(merged, null, 2)}\n`);
   }
   /** Apply the OneBot websocket configuration through SnowLuma's own WebUI API so the running
    *  service picks the change up live — no supervisor restart and the QQ login stays untouched. */

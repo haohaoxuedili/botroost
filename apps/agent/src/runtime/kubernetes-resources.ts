@@ -6,21 +6,36 @@ export function kubernetesResources(input: RuntimeSpec, profile: KubernetesProfi
   const selector = { 'botroost.endpoint_id': input.labels['botroost.endpoint_id']! };
   const secret = { apiVersion: 'v1', kind: 'Secret', metadata, type: 'Opaque', stringData: { HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '', http_proxy: '', https_proxy: '', all_proxy: '', NO_PROXY: '', no_proxy: '', ...input.environment } };
   const pvc = { apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { ...metadata }, spec: { accessModes: ['ReadWriteOnce'], ...(profile.storageClass ? { storageClassName: profile.storageClass } : {}), resources: { requests: { storage: profile.volumeSize } } } };
-  const service = { apiVersion: 'v1', kind: 'Service', metadata, spec: { type: 'ClusterIP', selector, ports: [{ name: 'management', port: 6099, targetPort: 6099 }] } };
+  // Providers address each other by Service name (<name>.<namespace>.svc), so every
+  // container port the provider talks to must be a Service port: Docker publishing and
+  // Kubernetes Service ports are the same contract from the provider's point of view.
+  const ports = input.ports?.length ? input.ports : [{ name: 'management', port: 6099 }];
+  const service = { apiVersion: 'v1', kind: 'Service', metadata, spec: { type: 'ClusterIP', selector, ports: ports.map(port => ({ name: port.name, port: port.port, targetPort: port.port })) } };
   const governing = { ...service, metadata: { ...metadata, name: `${input.name}-head` }, spec: { ...service.spec, clusterIP: 'None' } };
   const resources = { requests: { cpu: `${input.resources.cpuMillis}m`, memory: `${input.resources.memoryMiB}Mi` }, limits: { cpu: `${input.resources.cpuMillis}m`, memory: `${input.resources.memoryMiB}Mi` } };
+  // Storage prep must create every subPath the workload mounts; an unset subPath makes
+  // the mount fail with no base directory, so derive the list instead of hardcoding.
+  const directories = [...new Set(input.volumes.map(volume => volume.name))].map(name => `mkdir -p /data/${name}`).join('\n        ');
+  const containerSecurity: Record<string, unknown> = { allowPrivilegeEscalation: false };
+  // Docker's --cap-add. Kubernetes grants the same capability through the container
+  // security context; anything not requested stays out of the pod.
+  if (input.capAdd?.length) { containerSecurity.capabilities = { add: input.capAdd }; containerSecurity.allowPrivilegeEscalation = true; }
+  // Docker's --security-opt. seccomp=unconfined is expressed as an explicit profile, and
+  // the pod-level profile must not then override it back to RuntimeDefault.
+  const seccompUnconfined = (input.securityOpt ?? []).some(option => /^seccomp[=:]unconfined$/i.test(option));
+  if (seccompUnconfined) containerSecurity.seccompProfile = { type: 'Unconfined' };
   const workload = { apiVersion: 'apps/v1', kind: 'StatefulSet', metadata, spec: {
     replicas: 0, serviceName: governing.metadata.name, selector: { matchLabels: selector }, updateStrategy: { type: 'OnDelete' },
     template: { metadata: { labels: input.labels }, spec: {
       automountServiceAccountToken: false, terminationGracePeriodSeconds: 30,
       ...(profile.nodeSelector ? { nodeSelector: profile.nodeSelector } : {}),
-      securityContext: { seccompProfile: { type: 'RuntimeDefault' } },
+      ...(seccompUnconfined ? {} : { securityContext: { seccompProfile: { type: 'RuntimeDefault' } } }),
       initContainers: [{ name: 'storage', image: input.image, command: ['/bin/sh', '-ec', `
-        mkdir -p /data/qq /data/config
+        ${directories}
         # Self-heal WebUI token drift: the PVC's webui.json persists the token from the
         # FIRST boot, so a rotated agent NAPCAT_TOKEN would be rejected forever. Rewrite
         # the persisted config from the (authoritative) Secret on every start.
-        if [ -n "$NAPCAT_WEBUI_SECRET_KEY" ]; then
+        if [ -n "$NAPCAT_WEBUI_SECRET_KEY" ] && [ -d /data/config ]; then
           mkdir -p /data/config
           if [ -f /data/config/webui.json ]; then
             sed -i "s/^\\([[:space:]]*\\"token\\"[[:space:]]*:[[:space:]]*\\)[^,}]*/\\1\\"$NAPCAT_WEBUI_SECRET_KEY\\"/" /data/config/webui.json
@@ -30,12 +45,20 @@ export function kubernetesResources(input: RuntimeSpec, profile: KubernetesProfi
         fi
       `], securityContext: { allowPrivilegeEscalation: false }, resources, volumeMounts: [{ name: 'data', mountPath: '/data' }] }],
       containers: [{ name: 'protocol', image: input.image, envFrom: [{ secretRef: { name: input.name } }], resources,
-        securityContext: { allowPrivilegeEscalation: false },
-        ports: [{ name: 'management', containerPort: 6099 }],
-        startupProbe: { tcpSocket: { port: 6099 }, periodSeconds: 5, failureThreshold: 60 },
-        readinessProbe: { tcpSocket: { port: 6099 }, periodSeconds: 10 },
-        volumeMounts: input.volumes.map(volume => ({ name: 'data', mountPath: volume.target, subPath: volume.name })) }],
-      volumes: [{ name: 'data', persistentVolumeClaim: { claimName: input.name } }],
+        securityContext: containerSecurity,
+        ports: ports.map(port => ({ name: port.name, containerPort: port.port })),
+        startupProbe: { tcpSocket: { port: ports[0]!.port }, periodSeconds: 5, failureThreshold: 60 },
+        readinessProbe: { tcpSocket: { port: ports[0]!.port }, periodSeconds: 10 },
+        volumeMounts: [
+          ...input.volumes.map(volume => ({ name: 'data', mountPath: volume.target, subPath: volume.name })),
+          ...(input.shmBytes ? [{ name: 'shm', mountPath: '/dev/shm' }] : []),
+        ] }],
+      // Docker's --shm-size. Pods default to 64Mi; providers driving a Chromium-based
+      // login flow need the larger shared memory segment or the browser crashes.
+      volumes: [
+        { name: 'data', persistentVolumeClaim: { claimName: input.name } },
+        ...(input.shmBytes ? [{ name: 'shm', emptyDir: { medium: 'Memory', sizeLimit: `${Math.ceil(input.shmBytes / (1024 * 1024))}Mi` } }] : []),
+      ],
     } },
   } };
   return { secret, pvc, service, governing, workload };

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { KubeConfig } from '@kubernetes/client-node';
 import { KubernetesDockerClient } from '../src/runtime/kubernetes-docker.js';
 import { PodRuntimeStorage, LocalRuntimeStorage, StorageFileMissing } from '../src/runtime/storage.js';
@@ -166,10 +166,10 @@ describe('PodRuntimeStorage', () => {
 
     // File content travels on stdin, never on the command line: an OneBot access token in the
     // config must not be visible in the exec request or the container's process list.
-    await storage.writeFile('/app/snowluma-data/config/onebot11.json', '{"a":"it\'s \"quoted\"\n"}');
+    await storage.writeFile('/app/snowluma-data/config/onebot11.json', '{"a":"it\'s "quoted"\n"}');
     const write = calls.at(-1)!;
     expect(write.args[2]).toBe("base64 -d > '/app/snowluma-data/config/onebot11.json'");
-    expect(write.stdin).toBe(Buffer.from('{"a":"it\'s \"quoted\"\n"}', 'utf8').toString('base64'));
+    expect(write.stdin).toBe(Buffer.from('{"a":"it\'s "quoted"\n"}', 'utf8').toString('base64'));
     expect(write.args[2]).not.toContain(write.stdin);
 
     // Every call is addressed at the workload the scope was created for.
@@ -194,9 +194,11 @@ describe('PodRuntimeStorage', () => {
   });
 
   it('creates directories world-writable so the image user can write them', async () => {
-    const exec = vi.fn(async (_name: string, _args: string[], _stdin?: string) => ({ stdout: '', stderr: '' }));
+    const calls: Array<{ name: string; args: string[] }> = [];
+    const exec = vi.fn(async (name: string, args: string[]) => { calls.push({ name, args }); return { stdout: '', stderr: '' }; });
     await new PodRuntimeStorage({ exec }).for('napcat-e1').ensureDirectory('/data/qq');
-    expect(exec.mock.calls[0]![1]).toEqual(['/bin/sh', '-c', "mkdir -p '/data/qq' && chmod 777 '/data/qq'"]);
+    expect(calls[0]!.name).toBe('napcat-e1');
+    expect(calls[0]!.args).toEqual(['/bin/sh', '-c', "mkdir -p '/data/qq' && chmod 777 '/data/qq'"]);
   });
 });
 
@@ -205,8 +207,8 @@ describe('LocalRuntimeStorage', () => {
     const storage = new LocalRuntimeStorage();
     expect(storage.kind).toBe('local');
     // A directory that does not exist yet is a normal first-run condition.
-    expect(await storage.for('unused').readdir('/nonexistent/botroost-test-dir')).toEqual([]);
-    await expect(storage.for('unused').readFile('/nonexistent/botroost-test-dir/x.json')).rejects.toBeInstanceOf(StorageFileMissing);
+    expect(await storage.for().readdir('/nonexistent/botroost-test-dir')).toEqual([]);
+    await expect(storage.for().readFile('/nonexistent/botroost-test-dir/x.json')).rejects.toBeInstanceOf(StorageFileMissing);
   });
 
   it('is what the providers use when no storage option is supplied', async () => {

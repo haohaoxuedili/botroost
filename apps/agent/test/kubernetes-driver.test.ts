@@ -49,6 +49,60 @@ describe('Kubernetes API lifecycle safety', () => {
       expect(patch.mock.calls.length).toBeGreaterThanOrEqual(3);
     } finally { read.mockRestore(); patch.mockRestore(); }
   }, 5000);
+  it('refuses a claim that belongs to another endpoint', async () => {
+    // Deleting by a reused name must not destroy a volume whose labels name someone else.
+    const { config } = fixture();
+    const claim = { apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { name: 'reused', uid: 'claim-uid', resourceVersion: '1', labels: { 'botroost.endpoint_id': 'someone-else', 'botroost.workspace_id': 'ws-2', 'botroost.provider': 'napcat' } } };
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockResolvedValue(claim as never);
+    const remove = vi.spyOn(KubernetesObjectApi.prototype, 'delete').mockResolvedValue({});
+    try {
+      const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi', agentNamespace: 'botroost-system' }, undefined, config);
+      await expect(driver.deleteData('reused', { endpointId: 'mine', workspaceId: 'ws-1', provider: 'napcat' })).rejects.toThrow(/ownership/);
+      expect(remove).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); remove.mockRestore(); }
+  }, 5000);
+
+  it('drops the claim of the endpoint it was told to delete', async () => {
+    const { config } = fixture();
+    const labels = { 'botroost.endpoint_id': 'mine', 'botroost.workspace_id': 'ws-1', 'botroost.provider': 'napcat' };
+    const claim = { apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { name: 'mine', uid: 'claim-uid', resourceVersion: '1', labels } };
+    let gone = false;
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockImplementation((async () => (gone ? null : claim)) as never);
+    const remove = vi.spyOn(KubernetesObjectApi.prototype, 'delete').mockImplementation(async () => { gone = true; return {}; });
+    try {
+      const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi', agentNamespace: 'botroost-system' }, undefined, config);
+      await driver.deleteData('mine', { endpointId: 'mine', workspaceId: 'ws-1', provider: 'napcat' });
+      expect(remove.mock.calls[0]?.[0]).toMatchObject({ kind: 'PersistentVolumeClaim', metadata: { name: 'mine' } });
+    } finally { read.mockRestore(); remove.mockRestore(); }
+  }, 5000);
+
+  it('does not delete a claim for a command whose lease was lost', async () => {
+    const { config } = fixture();
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockResolvedValue({ apiVersion: 'v1', kind: 'PersistentVolumeClaim', metadata: { name: 'mine', uid: 'claim-uid', labels: { 'botroost.endpoint_id': 'mine', 'botroost.workspace_id': 'ws-1', 'botroost.provider': 'napcat' } } } as never);
+    const remove = vi.spyOn(KubernetesObjectApi.prototype, 'delete').mockResolvedValue({});
+    try {
+      const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi', agentNamespace: 'botroost-system' }, undefined, config);
+      const aborted = AbortSignal.abort(new Error('command lease refresh failed'));
+      await expect(driver.deleteData('mine', { endpointId: 'mine', workspaceId: 'ws-1', provider: 'napcat' }, aborted)).rejects.toThrow(/lease/);
+      await expect(driver.delete('mine', aborted)).rejects.toThrow(/lease/);
+      expect(remove).not.toHaveBeenCalled();
+    } finally { read.mockRestore(); remove.mockRestore(); }
+  }, 5000);
+
+  it('lets a retry finish claim cleanup after the workload is already gone', async () => {
+    // The first attempt removed the StatefulSet and then failed on the claim; the retry must
+    // not refuse because there is no workload left to read ownership from.
+    const { config } = fixture();
+    const seen: string[] = [];
+    const read = vi.spyOn(KubernetesObjectApi.prototype, 'read').mockImplementation((async (object: { kind?: string }) => { seen.push(String(object.kind)); return null; }) as never);
+    try {
+      const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi', agentNamespace: 'botroost-system' }, undefined, config);
+      await expect(driver.delete('gone')).resolves.toBeUndefined();
+      await expect(driver.deleteData('gone', { endpointId: 'gone', workspaceId: 'ws-1', provider: 'napcat' })).resolves.toBeUndefined();
+      expect(seen).toContain('StatefulSet');
+    } finally { read.mockRestore(); }
+  }, 5000);
+
   it('addresses a NetworkPolicy in its own API group', async () => {
     // A NetworkPolicy read or deleted as "v1" fails with "Unrecognized API version and kind",
     // which is what broke snowluma start and delete in production.

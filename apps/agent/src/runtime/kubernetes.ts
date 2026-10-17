@@ -1,7 +1,7 @@
 import { CoreV1Api, KubeConfig, KubernetesObjectApi, PatchStrategy, Metrics, type KubernetesObject } from '@kubernetes/client-node';
 import type { DockerInspectResult } from '../index.js';
 import type { DockerResourceSample } from '../resource-usage.js';
-import type { RuntimeDriver, RuntimeSpec } from './types.js';
+import type { RuntimeDriver, RuntimeOwner, RuntimeSpec } from './types.js';
 import { kubernetesResources, type KubernetesProfile } from './kubernetes-resources.js';
 // Dynamic discovery API spans several resource schemas.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -63,6 +63,12 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
       if (!current) throw new Error('Runtime resource disappeared before it could be updated');
       return this.objects.patch({ ...object, metadata: { ...object.metadata, resourceVersion: current.metadata!.resourceVersion! } }, undefined, undefined, 'botroost-agent', undefined, PatchStrategy.MergePatch);
     });
+  }
+  /** Both the agent-wide shutdown signal and the per-command signal fence every destructive
+   *  request: a command whose lease was lost must not delete anything. */
+  private guard(signal?: AbortSignal) {
+    this.signal?.throwIfAborted();
+    signal?.throwIfAborted();
   }
   private owned(object: ObjectState, labels: Record<string,string>) {
     for (const key of ['botroost.endpoint_id', 'botroost.workspace_id', 'botroost.provider']) if (!labels[key] || object.metadata?.labels?.[key] !== labels[key]) throw new Error('Runtime resource ownership mismatch');
@@ -231,22 +237,38 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   forceRestart(name: string, operation: string) { return this.restart(name, operation); }
   /** Removes the workload and its supporting objects but keeps the claim: replacement (image,
    *  resources, proxy) must not discard the login state stored on the endpoint's volume. */
-  async delete(name: string) {
+  async delete(name: string, signal?: AbortSignal) {
+    this.guard(signal);
     const workload = await this.read('StatefulSet', name);
-    if (!workload) throw new Error('Runtime ownership unavailable; retained resources require operator review');
-    await this.stop(name);
-    // Workload removed last so interrupted cleanup retains ownership evidence.
-    for (const [kind, resourceName] of [['NetworkPolicy', `${name}-ingress`], ['Service', name], ['Service', `${name}-head`], ['Secret', name], ['StatefulSet', name]]) {
-      const object = await this.read(kind!, resourceName!);
-      if (object) { this.owned(object, workload.metadata!.labels!); await this.remove(object); }
+    // A retry after a failed claim cleanup finds no workload: the resources are already gone,
+    // so there is nothing left to refuse. Only an unknown owner is an operator problem.
+    if (workload) {
+      await this.stop(name);
+      // Workload removed last so interrupted cleanup retains ownership evidence.
+      for (const [kind, resourceName] of [['NetworkPolicy', `${name}-ingress`], ['Service', name], ['Service', `${name}-head`], ['Secret', name], ['StatefulSet', name]]) {
+        const object = await this.read(kind!, resourceName!);
+        if (object) { this.guard(signal); this.owned(object, workload.metadata!.labels!); await this.remove(object); }
+      }
+      return;
     }
+    const survivors = (await Promise.all([['NetworkPolicy', `${name}-ingress`], ['Service', name], ['Service', `${name}-head`], ['Secret', name]].map(([kind, resourceName]) => this.read(kind!, resourceName!))))
+      .filter((object): object is ObjectState => Boolean(object));
+    if (survivors.length) throw new Error('Runtime ownership unavailable; retained resources require operator review');
   }
-  /** Explicit endpoint deletion, which is the only path allowed to destroy durable data. */
-  async deleteData(name: string) {
+  /** Explicit endpoint deletion, which is the only path allowed to destroy durable data.
+   *  `owner` is the identity of the endpoint being deleted: a claim that merely carries labels
+   *  identical to itself would let a reused name destroy another endpoint's data. */
+  async deleteData(name: string, owner: RuntimeOwner = {}, signal?: AbortSignal) {
+    this.guard(signal);
     const claim = await this.read('PersistentVolumeClaim', name);
     if (!claim) return;
-    // The workload is gone by now, so its labels are the only ownership evidence left.
-    this.owned(claim, claim.metadata!.labels!);
+    const anonymous = owner.endpointId === undefined && owner.workspaceId === undefined && owner.provider === undefined;
+    // No identity supplied: the claim is only allowed to vouch for itself.
+    const expected: Record<string, string> = anonymous
+      ? claim.metadata!.labels ?? {}
+      : { 'botroost.endpoint_id': owner.endpointId!, 'botroost.workspace_id': owner.workspaceId!, 'botroost.provider': owner.provider! };
+    this.owned(claim, expected);
+    this.guard(signal);
     await this.remove(claim);
   }
   async logs(name: string, options: { tail: number; sinceSeconds: number; timestamps?: boolean; maxBytes?: number }) {

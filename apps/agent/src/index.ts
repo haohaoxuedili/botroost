@@ -440,6 +440,8 @@ export class NapCatRuntime {
   private readonly containerPrefix: string;
   private readonly fetcher: FetchLike;
   private readonly commands = new Map<string, RuntimeCommand>();
+  /** Which form of the configured token each endpoint's NapCat actually stored. */
+  private readonly napcatTokenVariants = new Map<string, "raw" | "trimmed">();
   private readonly snapshotCache = new Map<string, { at: number; value: Awaited<ReturnType<NapCatRuntime["snapshot"]>> }>();
   private readonly directoryCache = new Map<string, {
     at: number;
@@ -797,20 +799,33 @@ export class NapCatRuntime {
   private async webCredential(endpointId: string, base: URL) {
     const cached=this.webCredentials.get(endpointId);
     if(cached)return cached;
-    // The token is hashed exactly as the container received it: NapCat writes it verbatim into
-    // webui.json, so a trailing newline in the secret is part of the token. Trimming it here
-    // produced a different hash and every login was answered with "token is invalid".
+    // NapCat writes the token verbatim into webui.json and hashes it on login, so a trailing
+    // newline in the secret is part of the token. Endpoints created by an agent that trimmed
+    // the token kept the trimmed value in their own secret, so neither form is universal:
+    // ask NapCat which one it stored, and remember the answer for this endpoint.
     const loginToken=this.options.napcatToken??process.env.NAPCAT_TOKEN??"";
-    const hashed=createHash("sha256").update(`${loginToken}.napcat`).digest("hex");
-    const auth=await this.fetcher(new URL("/api/auth/login",base),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({hash:hashed}),signal:this.requestSignal(10_000)});
-    if(!auth.ok)throw new Error(`NapCat auth failed: ${auth.status}`);
-    const authBody=await auth.json() as JsonObject;
-    if(typeof authBody.code==="number"&&authBody.code!==0)throw new Error(`NapCat auth rejected: ${String(authBody.message??authBody.code)}`);
-    const authData=authBody.data;
-    const credential=authData!==null&&typeof authData==="object"&&!Array.isArray(authData)?authData.Credential:undefined;
-    if(typeof credential!=="string"||!credential)throw new Error("NapCat auth token missing");
-    this.webCredentials.set(endpointId,credential);
-    return credential;
+    const remembered=this.napcatTokenVariants.get(endpointId);
+    const candidates=remembered==="trimmed"?[loginToken.trim()]
+      :remembered==="raw"?[loginToken]
+      :[loginToken,loginToken.trim()].filter((value,index,all)=>all.indexOf(value)===index);
+    let rejection: Error|undefined;
+    for(const candidate of candidates){
+      const hashed=createHash("sha256").update(`${candidate}.napcat`).digest("hex");
+      const auth=await this.fetcher(new URL("/api/auth/login",base),{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({hash:hashed}),signal:this.requestSignal(10_000)});
+      if(!auth.ok)throw new Error(`NapCat auth failed: ${auth.status}`);
+      const authBody=await auth.json() as JsonObject;
+      if(typeof authBody.code==="number"&&authBody.code!==0){
+        rejection=new Error(`NapCat auth rejected: ${String(authBody.message??authBody.code)}`);
+        continue;
+      }
+      const authData=authBody.data;
+      const credential=authData!==null&&typeof authData==="object"&&!Array.isArray(authData)?authData.Credential:undefined;
+      if(typeof credential!=="string"||!credential)throw new Error("NapCat auth token missing");
+      this.napcatTokenVariants.set(endpointId,candidate===loginToken?"raw":"trimmed");
+      this.webCredentials.set(endpointId,credential);
+      return credential;
+    }
+    throw rejection??new Error("NapCat auth token missing");
   }
   private async protocolTraffic(endpointId: string): Promise<JsonObject> {
     const now = Date.now();

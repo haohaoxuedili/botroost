@@ -584,6 +584,33 @@ describe("NapCat runtime", () => {
     expect(hashes[0]).not.toBe(hash("operator-token"));
   }, 5000);
 
+  it("falls back to the trimmed token for an endpoint provisioned with one", async () => {
+    // prod/gz-01/gz-02 were created by an agent that trimmed the token, so their own secret has
+    // no trailing newline. Neither form can be assumed: the runtime asks NapCat which one works.
+    const labels = { "botroost.workspace_id": baseCommand.workspaceId, "botroost.endpoint_id": baseCommand.endpointId, "botroost.provider": "napcat" };
+    const driver = {
+      backend: "kubernetes" as const,
+      inspect: vi.fn(async () => ({ id: "pod", name: "runtime", image: NAPCAT_IMAGE, state: "running" as const, ipAddress: "runtime.pool.svc", labels })),
+      ensure: vi.fn(), start: vi.fn(), stop: vi.fn(), restart: vi.fn(), forceRestart: vi.fn(), delete: vi.fn(), logs: vi.fn(async () => ""),
+    };
+    const hash = (token: string) => createHash("sha256").update(`${token}.napcat`).digest("hex");
+    const hashes: string[] = [];
+    const fetcher: FetchLike = async (url, init) => {
+      if (new URL(String(url)).pathname === "/api/auth/login") {
+        const sent = JSON.parse(String(init?.body ?? "{}")).hash;
+        hashes.push(sent);
+        // This NapCat only knows the trimmed token.
+        if (sent !== hash("operator-token")) return new Response(JSON.stringify({ code: -1, message: "token is invalid" }));
+      }
+      return new Response(JSON.stringify({ code: 0, data: { Credential: "test-credential" } }));
+    };
+    const runtime = new NapCatRuntime({ driver, docker: new RecordingDocker(), stateDirectory: await mkdtemp(join(tmpdir(), "botroost-napcat-trimmed-")), napcatToken: "operator-token\n", fetcher });
+    await runtime.snapshot({ ...baseCommand, metadata: {} }).catch(() => undefined);
+    expect(hashes[0]).toBe(hash("operator-token\n"));
+    expect(hashes[1]).toBe(hash("operator-token"));
+    expect(hashes.length).toBeGreaterThan(1);
+  }, 5000);
+
   it("keeps protocol health and successful QQ resources when one directory action fails", async () => {
     const docker = new RecordingDocker();
     docker.inspect = async () => ({ id: "container-id", name: "botroost-napcat-33333333-3333-4333-8333-333333333333", image: NAPCAT_IMAGE, state: "running" as const, ipAddress: "172.18.0.10", labels: { "botroost.workspace_id": baseCommand.workspaceId, "botroost.endpoint_id": baseCommand.endpointId, "botroost.provider": "napcat" } });

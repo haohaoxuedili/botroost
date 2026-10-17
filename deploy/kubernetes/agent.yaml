@@ -23,6 +23,11 @@ rules:
   - apiGroups: [apps]
     resources: [statefulsets]
     verbs: [get, create, patch, delete]
+  # Without this the agent cannot create an endpoint's ingress policy, and cannot read it back
+  # while cleaning up a deletion: the cluster answers 403 Forbidden.
+  - apiGroups: ['networking.k8s.io']
+    resources: [networkpolicies]
+    verbs: [get, create, patch, delete]
   - apiGroups: ['']
     resources: [services, secrets, persistentvolumeclaims]
     verbs: [get, create, patch, delete]

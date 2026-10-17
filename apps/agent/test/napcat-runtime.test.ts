@@ -392,6 +392,32 @@ describe("NapCat runtime", () => {
     expect(await new NapCatRuntime({ docker, stateDirectory: root, napcatToken: "operator-token" }).observations()).toEqual([]);
   });
 
+  it("discards the claim when an endpoint is deleted through the Kubernetes driver", async () => {
+    // driver.delete() removes the workload but keeps the claim on purpose, because a restart
+    // replaces the workload. An explicit endpoint deletion must drop the durable data too.
+    const labels = { "botroost.workspace_id": baseCommand.workspaceId, "botroost.endpoint_id": baseCommand.endpointId, "botroost.provider": "napcat" };
+    const order: string[] = [];
+    const driver = {
+      backend: "kubernetes" as const,
+      inspect: vi.fn(async () => ({ id: "pod", name: "runtime", image: NAPCAT_IMAGE, state: "running" as const, ipAddress: "runtime.pool.svc", labels })),
+      ensure: vi.fn(), start: vi.fn(), stop: vi.fn(), restart: vi.fn(), forceRestart: vi.fn(), logs: vi.fn(async () => ""),
+      delete: vi.fn(async () => { order.push("workload"); }),
+      deleteData: vi.fn(async () => { order.push("data"); }),
+    };
+    const runtime = new NapCatRuntime({
+      driver,
+      docker: new RecordingDocker(),
+      stateDirectory: await mkdtemp(join(tmpdir(), "botroost-napcat-claim-")),
+      napcatToken: "operator-token",
+      // Deletion never talks to NapCat; a stub keeps the probe from leaving the sandbox.
+      fetcher: async (url) => new Response(JSON.stringify({ code: 0, data: new URL(String(url)).pathname === "/api/auth/login" ? { Credential: "credential" } : { isLogin: false, isOffline: false, qrcodeurl: "" } })),
+    });
+    await runtime.apply("runtime:initial", baseCommand);
+    const deleting = { ...baseCommand, commandId: "cmd-delete", operationId: "op-delete", generation: 2, action: "delete" } as unknown as RuntimeCommand;
+    await runtime.apply("runtime:delete", deleting);
+    expect(order).toEqual(["workload", "data"]);
+  }, 5000);
+
   it("retries host-state cleanup after the protocol container was already removed", async () => {
     const docker = new RecordingDocker();
     docker.hostStateRemovalFailures=1;

@@ -564,6 +564,9 @@ export class NapCatRuntime {
       };
       if (command.action === 'delete') {
         await driver.delete(name);
+        // The workload is gone but its claim is not: explicit deletion is the only path
+        // allowed to discard durable state, so drop it before reporting success.
+        await driver.deleteData?.(name);
         this.commands.delete(command.endpointId);
         await this.persistCommands();
         this.snapshotCache.delete(command.endpointId);

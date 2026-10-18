@@ -189,4 +189,22 @@ describe('Kubernetes API lifecycle safety', () => {
     expect(result.has('uid-other')).toBe(false);
     expect(metrics).toBeTruthy();
   });
+  it('falls back to the pod name when PodMetrics omits metadata.uid', async () => {
+    const { config } = fixture();
+    const driver = new KubernetesRuntimeDriver({ namespace: 'test', volumeSize: '2Gi' }, undefined, config);
+    // The hk cluster's metrics-server returns no uid at all; inspect() is what records the pair.
+    driver['podUidToName'].set('uid-a', 'pod-a');
+    // @ts-expect-error: Metrics is constructed with the config; substitute a stub.
+    driver['metricsApi'] = { getPodMetrics: async () => ({
+      kind: 'PodMetricsList', apiVersion: 'metrics.k8s.io/v1beta1', metadata: {},
+      items: [
+        { metadata: { name: 'pod-a', namespace: 'test', creationTimestamp: '' }, timestamp: '', window: '30s', containers: [{ name: 'protocol', usage: { cpu: '2000000n', memory: '4Mi' } }] },
+        { metadata: { name: 'pod-unknown', namespace: 'test', creationTimestamp: '' }, timestamp: '', window: '30s', containers: [{ name: 'protocol', usage: { cpu: '9000000n', memory: '9Mi' } }] },
+      ],
+    } as never) };
+    const result = await driver.stats(['uid-a']);
+    expect(result.get('uid-a')).toEqual({ cpuPercent: 0.2, memoryBytes: 4 * 1024 * 1024 });
+    // A pod nobody asked about is not invented into the result.
+    expect(result.size).toBe(1);
+  });
 });

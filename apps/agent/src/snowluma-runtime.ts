@@ -12,6 +12,8 @@ import {
 } from "@botroost/agent-protocol";
 import { NapCatTrafficAccumulator, parseSnowlumaConnectionLine, parseSnowlumaTrafficLine } from "./traffic.js";
 import { LocalRuntimeStorage, type RuntimeStorage } from "./runtime/storage.js";
+// Pure module (no runtime side effects): the workload name limit the Kubernetes driver enforces.
+import { WORKLOAD_NAME_LIMIT } from "./runtime/kubernetes-resources.js";
 import { loginUrl, runtimeDialPort, runtimeHost } from "./runtime/login-links.js";
 import type {
   AgentCommandTransport,
@@ -95,6 +97,7 @@ const redactLogs = (text: string) => text
 export class SnowLumaRuntime {
   private readonly networkMode: string;
   private readonly containerPrefix: string;
+  private readonly kubernetes: boolean;
   private readonly fetcher: FetchLike;
   private readonly commands = new Map<string, RuntimeCommand>();
   private readonly snapshotCache = new Map<string, { at: number; value: SnowlumaSnapshot }>();
@@ -117,9 +120,14 @@ export class SnowLumaRuntime {
     storage?: RuntimeStorage;
     /** Kubernetes backend: the in-container mount target for each volume name. */
     containerMounts?: Record<string, string>;
+    /** Kubernetes names the pods it creates after the workload, so the workload name has to leave
+     *  room for the controller's suffix (see containerName). Docker keeps the full endpoint id:
+     *  container names and the state directories keyed by them must stay stable. */
+    kubernetes?: boolean;
   }) {
     this.networkMode = options.networkMode ?? process.env.SNOWLUMA_DOCKER_NETWORK ?? "bridge";
     this.containerPrefix = options.containerPrefix ?? "botroost-snowluma";
+    this.kubernetes = options.kubernetes ?? false;
     if (!/^[a-z0-9][a-z0-9_.-]{0,63}$/i.test(this.networkMode) || this.networkMode === "host" || this.networkMode.startsWith("container:")) throw new Error("SnowLuma docker network is invalid");
     if (!containerPrefixPattern.test(this.containerPrefix)) throw new Error("container prefix is invalid");
     this.fetcher = options.fetcher ?? globalThis.fetch;
@@ -159,7 +167,19 @@ export class SnowLumaRuntime {
   }
   private containerName(endpointId: string) {
     if (!endpointIdPattern.test(endpointId)) throw new Error("endpoint identifier is invalid");
-    return `${this.containerPrefix}-${endpointId}`;
+    const name = `${this.containerPrefix}-${endpointId}`;
+    // Kubernetes names every pod it creates after the workload and stamps it with
+    // controller-revision-hash = "<workload name>-<10 char revision>"; a label value over 63
+    // characters makes the pod invalid, so the StatefulSet controller retries the create
+    // forever ("must be no more than 63 characters"). SnowLuma's prefix is two characters
+    // longer than NapCat's, which is exactly enough to cross that line, so the id part is
+    // trimmed to whatever fits. The full id stays on the botroost.endpoint_id label, which is
+    // what the driver looks resources up by. Docker is untouched: its container names and the
+    // state directories keyed by them have to keep matching what is already on disk.
+    if (!this.kubernetes || name.length <= WORKLOAD_NAME_LIMIT) return name;
+    const room = WORKLOAD_NAME_LIMIT - this.containerPrefix.length - 1;
+    if (room < 1) throw new Error("container prefix is too long for Kubernetes");
+    return `${this.containerPrefix}-${endpointId.slice(0, room)}`;
   }
   private assertAllowed(command: RuntimeCommand) {
     const image = typeof command.metadata.image === "string" ? command.metadata.image : "";

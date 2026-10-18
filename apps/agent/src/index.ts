@@ -1312,7 +1312,7 @@ const consoleNamespaces = () => (process.env.RUNTIME_CONSOLE_NAMESPACES ?? "")
         stateDirectory: join(nodeStateDir, "snowluma"),
         // Docker: host bind-mount sources. Kubernetes: paths inside the endpoint pod, which
         // is where the protocol container mounts the claim.
-        ...(kube ? { containerMounts: snowlumaContainerMounts() } : { hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma") }),
+        ...(kube ? { containerMounts: snowlumaContainerMounts(), kubernetes: true } : { hostStateDirectory: join(process.env.SNOWLUMA_HOST_STATE_DIR ?? nodeStateDir, "snowluma") }),
         storage: kube ? new PodRuntimeStorage(docker) : new LocalRuntimeStorage(),
         ...(signal === undefined ? {} : { signal }),
         ...(process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN === undefined ? {} : { onebotAccessToken: process.env.SNOWLUMA_ONEBOT_ACCESS_TOKEN }),

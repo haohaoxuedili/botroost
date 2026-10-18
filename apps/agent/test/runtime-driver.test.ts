@@ -39,6 +39,18 @@ describe('Kubernetes resource contract', () => {
   it('rejects unsafe resource names', () => {
     expect(() => kubernetesResources({ ...input, name: '../../bad' }, { namespace: 'test', volumeSize: '2Gi' })).toThrow();
   });
+  it('caps workload names at 52 characters so the controller revision label fits in 63', () => {
+    // The StatefulSet controller labels every pod with controller-revision-hash =
+    // "<workload name>-<10 char revision>", a label value capped at 63 characters. A 54
+    // character name (SnowLuma's prefix is two longer than NapCat's) made the API server
+    // reject every pod, so the controller retried the create forever.
+    expect(() => kubernetesResources({ ...input, name: 'a'.repeat(52) }, { namespace: 'test', volumeSize: '2Gi' })).not.toThrow();
+    expect(() => kubernetesResources({ ...input, name: 'a'.repeat(53) }, { namespace: 'test', volumeSize: '2Gi' })).toThrow(/Invalid Kubernetes resource name/);
+  });
+  it('leaves the namespace limit at 63: only workload names feed the revision label', () => {
+    expect(() => kubernetesResources(input, { namespace: 'n'.repeat(63), volumeSize: '2Gi' })).not.toThrow();
+    expect(() => kubernetesResources(input, { namespace: 'n'.repeat(64), volumeSize: '2Gi' })).toThrow(/Invalid Kubernetes namespace/);
+  });
   it('init container rewrites the persisted webui token from the Secret on every start', () => {
     const r = kubernetesResources(input, { namespace: 'test', volumeSize: '2Gi' });
     const init = r.workload.spec.template.spec.initContainers[0]!;

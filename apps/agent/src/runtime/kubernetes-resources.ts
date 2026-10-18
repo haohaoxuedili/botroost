@@ -2,8 +2,16 @@ import type { RuntimeSpec } from './types.js';
 export interface KubernetesProfile { namespace: string; storageClass?: string; volumeSize: string; nodeSelector?: Record<string,string>; /** Namespace the agent runs in. When set, each runtime Service is fenced off so only the
    *  agent can reach the provider's management/UI ports. */ agentNamespace?: string; /** Extra namespaces allowed to reach the UI ports, e.g. the console API's own namespace: it
    *  proxies the runtime UI, so fencing it out would break every login screen. */ consoleNamespaces?: string[] }
+/** Longest workload name the API server accepts here. Not 63: the StatefulSet controller
+ *  labels every pod it creates with `controller-revision-hash` = "<workload name>-<10 char
+ *  revision>", and a label value over 63 characters makes the pod invalid, so the controller
+ *  retries the create forever. 63 - 1 - 10 = 52. */
+export const WORKLOAD_NAME_LIMIT = 52;
+const namePattern = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
 export function kubernetesResources(input: RuntimeSpec, profile: KubernetesProfile) {
-  for (const name of [input.name, profile.namespace]) if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) || name.length > 63) throw new Error('Invalid Kubernetes resource name');
+  // The namespace is not a workload name: it is capped at 63 like any other label-sized name.
+  if (!namePattern.test(profile.namespace) || profile.namespace.length > 63) throw new Error('Invalid Kubernetes namespace');
+  if (!namePattern.test(input.name) || input.name.length > WORKLOAD_NAME_LIMIT) throw new Error('Invalid Kubernetes resource name');
   const metadata = { name: input.name, namespace: profile.namespace, labels: input.labels };
   // The Service selector must be unique to this workload. An endpoint id alone matches any
   // other ready pod that carries it (another workspace or provider reusing the id), and the

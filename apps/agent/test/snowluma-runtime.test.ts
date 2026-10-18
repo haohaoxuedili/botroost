@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { dockerCreateArguments, NAPCAT_IMAGE, type DockerClient, type DockerInspectResult, type FetchLike } from "../src/index.js";
 import { SNOWLUMA_ARTIFACT, SNOWLUMA_IMAGE, SnowLumaRuntime, snowlumaLoginPorts } from "../src/snowluma-runtime.js";
+import { WORKLOAD_NAME_LIMIT } from "../src/runtime/kubernetes-resources.js";
 import type { RuntimeCommand } from "@botroost/agent-protocol";
 
 const baseCommand: RuntimeCommand = {
@@ -398,5 +399,31 @@ describe("docker create arguments", () => {
       "--mount", "type=bind,src=/qq,dst=/app/napcat/config",
       NAPCAT_IMAGE,
     ]);
+  });
+  it("shortens the Kubernetes workload name so pod labels stay within the 63 character limit", () => {
+    // The StatefulSet controller labels every pod with
+    // controller-revision-hash = "<workload name>-<10 char revision>". SnowLuma's 54 character
+    // name produced a 65 character label value and the API server rejected the pod outright.
+    const endpointId = "282e4585-34d0-46ba-be50-b9db98123e9e";
+    const runtime = new SnowLumaRuntime({ docker: new RecordingDocker(), stateDirectory: "/tmp/botroost-name-test", kubernetes: true });
+    const name = runtime["containerName"](endpointId);
+    // Keeps every id character that fits rather than dropping to a fixed short form.
+    expect(name).toBe("botroost-snowluma-282e4585-34d0-46ba-be50-b9db98123e");
+    expect(name.length).toBe(WORKLOAD_NAME_LIMIT);
+    expect(name.length + 1 + 10).toBeLessThanOrEqual(63);
+    // The full id still reaches the driver: it looks every resource up by this label.
+    expect(endpointId.startsWith(name.slice("botroost-snowluma-".length))).toBe(true);
+    // Same endpoint, same name: the agent reconciles on every tick and must not churn the workload.
+    expect(runtime["containerName"](endpointId)).toBe(name);
+  });
+  it("leaves a name that already fits untouched, so NapCat-sized names never change", () => {
+    const endpointId = "282e4585-34d0-46ba-be50-b9db98123e9e";
+    const runtime = new SnowLumaRuntime({ docker: new RecordingDocker(), stateDirectory: "/tmp/botroost-name-test", containerPrefix: "botroost-sl", kubernetes: true });
+    expect(runtime["containerName"](endpointId)).toBe(`botroost-sl-${endpointId}`);
+  });
+  it("keeps the full container name outside Kubernetes so existing containers and state dirs still match", () => {
+    const endpointId = "282e4585-34d0-46ba-be50-b9db98123e9e";
+    const runtime = new SnowLumaRuntime({ docker: new RecordingDocker(), stateDirectory: "/tmp/botroost-name-test" });
+    expect(runtime["containerName"](endpointId)).toBe(`botroost-snowluma-${endpointId}`);
   });
 });

@@ -12,6 +12,9 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
   private objects: KubernetesObjectApi;
   private core: CoreV1Api;
   private metricsApi?: Metrics;
+  /** Pod UID -> pod name. metrics-server omits metadata.uid from PodMetrics, so stats() has to
+   *  match on name; inspect() records the pair because it already reads the pod. */
+  private podUidToName = new Map<string, string>();
   private kc: KubeConfig;
   constructor(private profile: KubernetesProfile, private signal?: AbortSignal, config?: KubeConfig) {
     const kc = config ?? new KubeConfig();
@@ -94,6 +97,13 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     if (!workload) return null;
     // read() is typed for the resources this client writes; a Pod also carries a status.podIP.
     const pod = await this.read('Pod', `${name}-0`) as (ObjectState & { status?: { podIP?: string } }) | null;
+    // Keep the UID->name pair for stats(): PodMetrics carries no uid, and this pod is already in
+    // hand, so the mapping costs no extra API call. A recreated pod replaces the old entry.
+    if (pod?.metadata?.uid && pod.metadata.name) {
+      const podName = pod.metadata.name;
+      this.podUidToName.forEach((known, uid) => { if (known === podName) this.podUidToName.delete(uid); });
+      this.podUidToName.set(pod.metadata.uid, podName);
+    }
     const service = await this.read('Service', name) as (ObjectState & { spec?: { clusterIP?: string } }) | null;
     const clusterIP = service?.spec?.clusterIP && service.spec.clusterIP !== 'None' ? service.spec.clusterIP : undefined;
     const template = (workload as { spec: { template: { spec: { containers: { image: string; resources?: { limits?: Record<string, string>; requests?: Record<string, string> }; envFrom?: { secretRef?: { name?: string } }[] }[] } } } }).spec.template.spec;
@@ -290,19 +300,24 @@ export class KubernetesRuntimeDriver implements RuntimeDriver {
     const ids = [...new Set(podUids)];
     if (!ids.length || !this.metricsApi) return new Map();
     const wanted = new Set(ids);
+    // metrics-server omits metadata.uid from PodMetrics (verified against the hk cluster), so
+    // fall back to the pod name inspect() recorded for each UID.
+    const byName = new Map<string, string>();
+    ids.forEach(uid => { const name = this.podUidToName.get(uid); if (name) byName.set(name, uid); });
     const list = await this.metricsApi.getPodMetrics(this.profile.namespace);
     signal?.throwIfAborted();
     const result = new Map<string, DockerResourceSample>();
     for (const pod of list.items) {
-      // client-node's PodMetric type omits `uid`, but metrics-server always sends it.
       const uid = (pod.metadata as { uid?: string } | undefined)?.uid;
-      if (!uid || !wanted.has(uid)) continue;
+      const name = pod.metadata?.name;
+      const key = uid && wanted.has(uid) ? uid : name ? byName.get(name) : undefined;
+      if (!key) continue;
       let nanoCpus = 0, memoryBytes = 0;
       for (const container of pod.containers) {
         nanoCpus += parseKubernetesQuantity(container.usage?.cpu);
         memoryBytes += parseKubernetesQuantity(container.usage?.memory);
       }
-      if (nanoCpus > 0 || memoryBytes > 0) result.set(uid, { cpuPercent: nanoCpus / 10_000_000, memoryBytes: Math.round(memoryBytes) });
+      if (nanoCpus > 0 || memoryBytes > 0) result.set(key, { cpuPercent: nanoCpus / 10_000_000, memoryBytes: Math.round(memoryBytes) });
     }
     return result;
   }

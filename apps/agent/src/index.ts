@@ -1284,6 +1284,7 @@ const consoleNamespaces = () => (process.env.RUNTIME_CONSOLE_NAMESPACES ?? "")
     kubernetesProfile ??= {
       namespace: process.env.RUNTIME_NAMESPACE ?? (() => { throw new Error("RUNTIME_NAMESPACE is required"); })(),
       volumeSize: process.env.RUNTIME_VOLUME_SIZE ?? "2Gi",
+      ...(process.env.RUNTIME_NODE_NAME?.trim() ? { nodeSelector: { "kubernetes.io/hostname": process.env.RUNTIME_NODE_NAME.trim() } } : {}),
       // The namespace this agent pod runs in; runtime Services are fenced to it so other
       // cluster workloads cannot reach an endpoint's UI or remote-desktop ports.
       ...(agentNamespace ? { agentNamespace } : {}),
